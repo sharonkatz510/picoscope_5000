@@ -1,60 +1,46 @@
 
-# PicoScope 5000B real-time streaming viewer (Python, Windows 11)
+# PicoScope 5000B Streaming Viewer (Python, Windows 11)
 
-This project connects to a PicoScope 5000A/5000B/5000D device using the **ps5000a** driver (PicoSDK), streams Channels A and B, and plots live data in a GUI.
+This app connects to PicoScope 5000 series hardware using the `ps5000a` driver (PicoSDK), streams Channels A and B, and plots live data in a PyQt5 GUI with an embedded Matplotlib plot. It uses the `ps5000aRunStreaming` + `ps5000aGetStreamingLatestValues` callback pattern.
 
-The core API path is:
-- `ps5000aOpenUnit` to open the scope
-- `ps5000aSetChannel` to enable Channels A and B and set coupling and range
-- `ps5000aRunStreaming` to start streaming mode
-- `ps5000aGetStreamingLatestValues` to receive data via the `ps5000aStreamingReady` callback
+## Overview
 
-These functions and the callback pattern are documented in Pico's 5000A API Programmer's Guide.  
-
-## What it does
-
-- Requests a sampling interval of **20 ms** (50 samples per second) from Channel A and Channel B
-- Runs streaming continuously (FIFO mode)
-- Updates the GUI plot every 20 ms and shows the latest ~5 seconds of data
-
-If you need a faster sampling rate (many samples per 20 ms screen update), change `sample_interval_ms` and the buffer settings in `picoscope_5000.py`.
+- Opens the scope, configures Channels A and B, and starts streaming automatically on launch.
+- Requests a sampling interval in nanoseconds (ns). Default UI selection is 1 µs (1,000 ns). The code automatically adjusts to the device’s minimum supported timebase when needed.
+- Keeps a rolling window buffer (default 20 ms) and refreshes the plot every 20 ms.
+- Normalizes the plotted amplitude by the selected full-scale range for each channel (y-axis spans ±0.5 by default).
 
 ## Requirements
 
-### 1) PicoSDK driver and DLLs
+### PicoSDK and DLLs
 
-You must install Pico Technology's Windows software that includes the **ps5000a** driver.
+Install Pico Technology software that provides the `ps5000a` driver.
 
-You need:
-- `ps5000a.dll` (the device driver DLL)
-- PicoScope USB drivers (installed with PicoScope software / PicoSDK)
+Needed:
+- `ps5000a.dll` (device driver)
+- PicoScope USB drivers (installed with PicoScope/PicoSDK)
+- Some installations also require `picoipp.dll` to be discoverable via PATH or in the same directory.
 
-The program loads `ps5000a.dll` via `ctypes.WinDLL()`.
+The program loads `ps5000a.dll` via `ctypes.WinDLL()`. It tries common install locations and respects an environment variable override.
 
-#### Where the DLL usually is
+Common DLL locations the app checks:
+- `C:\Program Files\Pico Technology\SDK\lib\ps5000a.dll`
+- `C:\Program Files\Pico Technology\PicoScope 7 T&M Stable\ps5000a.dll`
+- `C:\Program Files\Pico Technology\PicoScope 6\ps5000a.dll`
+- 32-bit variants under `C:\Program Files (x86)\...`
 
-Common locations:
-- `C:\Program Files\Pico Technology\PicoSDK\lib\ps5000a.dll`
-- `C:\Program Files (x86)\Pico Technology\PicoSDK\lib\ps5000a.dll`
-
-If your install is elsewhere, set an environment variable to the full path:
-
-- `PICO_PS5000A_DLL=C:\full\path\to\ps5000a.dll`
-
-Example (PowerShell):
+Override via environment variable (PowerShell):
 ```powershell
-setx PICO_PS5000A_DLL "C:\Program Files\Pico Technology\PicoSDK\lib\ps5000a.dll"
+setx PICO_PS5000A_DLL "C:\full\path\to\ps5000a.dll"
 ```
+Restart the terminal after setting.
 
-Close and reopen the terminal after setting it.
+### Python
 
-### 2) Python
+- Python 3.10+ (64-bit) on Windows 11
 
-Recommended: Python 3.10+ (64-bit)
+### Python packages
 
-### 3) Python packages
-
-Install:
 - numpy
 - PyQt5
 - matplotlib
@@ -64,45 +50,49 @@ Install with:
 python -m pip install -r requirements.txt
 ```
 
-## Install and run
+## Run
 
-1) Install PicoScope software or PicoSDK so `ps5000a.dll` exists on your machine.
-
-2) Create and activate a virtual environment (recommended):
-```powershell
-python -m venv .venv
-.venv\Scripts\activate
-```
-
-3) Install Python dependencies:
-```powershell
-python -m pip install -r requirements.txt
-```
-
-4) Run:
 ```powershell
 python picoscope_5000.py
 ```
 
-Click **Start** to connect and stream, and **Stop** to disconnect.
+On startup the app attempts to open the first available scope, configures it, and starts streaming.
 
-## Configuration
+## UI Controls
 
-Edit `StreamConfig` in `picoscope_5000.py`:
+- Channel ranges: Two combo boxes set `A` and `B` voltage ranges from 10 mV to 20 V.
+- Sampling rate: A combo box (50 ns … 10 µs) plus “Apply Rate” button. The actual interval may adjust to the device minimum; the status bar shows the active ns value.
+- Trigger: Checkbox enables/disables a simple rising-edge trigger. Enter level in volts; it converts to device counts based on the selected range.
+- Timebase window: Buttons `−` and `+` step the rolling window through predefined durations (10 µs … 10 ms). A spin box allows precise window control (0.010 ms … 10.000 ms).
 
-- `sample_interval_ms`: requested time between samples (default 20)
-- `range_a`, `range_b`: channel voltage ranges (default +/- 2 V)
-- `coupling`: AC or DC (default DC)
-- `resolution`: 8, 12, 14, 15, 16-bit (default 12-bit)
-- `driver_buffer_size`: size of the driver overview buffers
-- `ring_buffer_seconds`: seconds shown in the plot
+## Configuration (`StreamConfig`)
 
-## Notes and troubleshooting
+Edit `StreamConfig` in the code for defaults:
+- `sample_interval_ns`: requested sample interval in ns (default 1000 ns = 1 µs)
+- `plot_refresh_ms`: GUI refresh period (default 20 ms)
+- `plot_window_ms`: rolling window duration (default 20.0 ms)
+- `plot_max_points`: decimation target for plotting (default 6000)
+- `range_a`, `range_b`: channel ranges (default 2 V)
+- `coupling`: `AC` or `DC` (default DC)
+- `resolution`: device resolution enum (default 8-bit)
+- `driver_buffer_size`: driver overview buffer size (default 200,000 samples)
+- `connect_delay_ms`: delay after open before acquisitions (default 1000 ms)
+- `simple_trigger_enabled`: off by default; see Trigger controls
+- `trigger_source`, `trigger_threshold_pct`, `trigger_direction`: trigger configuration
 
-- If you see a DLL load error, confirm `ps5000a.dll` is installed and matches your Python bitness (use 64-bit DLL with 64-bit Python).
-- If the scope requires external power and it is not connected, the driver can return a power related error when opening the unit. Connect the PSU if your model requires it.
-- This example uses only Channels A and B.
+## Internal Behavior
+
+- Uses `ps5000aSetDataBuffer` (raw ADC counts) and converts to volts on the fly using the selected range.
+- Maintains ring buffers per channel sized to the current window, and decimates to `plot_max_points` for efficient plotting.
+- Automatically checks minimum achievable timebase via `ps5000aGetMinimumTimebaseStateless` and adjusts if a requested interval is too fast.
+- Attempts to preload `picoipp.dll` from the DLL directory; also adds common PicoSDK folders via `os.add_dll_directory` when available.
+
+## Troubleshooting
+
+- DLL not found: ensure `ps5000a.dll` is installed and matches Python bitness (use 64-bit DLL with 64-bit Python). Set `PICO_PS5000A_DLL` if installed to a non-standard path.
+- Missing `picoipp.dll`: install PicoSDK and ensure its `lib` folders are on PATH or in the same directory as `ps5000a.dll`.
+- Power source messages: some models require acknowledging power status. The app handles `ps5000aChangePowerSource` based on the code returned by `ps5000aOpenUnit`.
 
 ## License
 
-This is an example script. You can adapt it for your lab usage.
+Example code for lab/engineering usage.
