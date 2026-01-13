@@ -16,7 +16,7 @@ import sys
 
 import numpy as np
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtWidgets, QtGui
 from plotter import PlotterWidget
 from picoscope_constants import (
     RANGE_CODES,
@@ -240,6 +240,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.timer.start()
 
         self.resize(900, 500)
+        # Keyboard shortcuts for cursor movement (Left/Right for X, Up/Down for Y)
+        self._short_left = QtWidgets.QShortcut(QtGui.QKeySequence('Left'), self)
+        self._short_left.activated.connect(lambda: self._on_key_move('v', -1))
+        self._short_right = QtWidgets.QShortcut(QtGui.QKeySequence('Right'), self)
+        self._short_right.activated.connect(lambda: self._on_key_move('v', 1))
+        self._short_up = QtWidgets.QShortcut(QtGui.QKeySequence('Up'), self)
+        self._short_up.activated.connect(lambda: self._on_key_move('h', 1))
+        self._short_down = QtWidgets.QShortcut(QtGui.QKeySequence('Down'), self)
+        self._short_down.activated.connect(lambda: self._on_key_move('h', -1))
 
     def update_plot(self) -> None:
         if self.streamer and self.streamer._running:
@@ -492,6 +501,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.streamer.close()
         finally:
             super().closeEvent(a0)
+
+    def _on_key_move(self, kind: str, direction: int) -> None:
+        data = self.cursor_select.currentData()
+        if not isinstance(data, tuple):
+            return
+        sel_kind, idx = data
+        if sel_kind != kind:
+            return
+        self.plotter.move_cursor(kind, idx, direction)
+        self._refresh_cursor_readouts()
 
 
 def picoscope_5000() -> int:

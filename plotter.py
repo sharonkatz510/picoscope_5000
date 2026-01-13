@@ -26,8 +26,8 @@ class PlotterWidget(QtWidgets.QWidget):
         layout.addWidget(self.canvas, 1)
 
         # Cursor state
-        self._cursor_step_frac_x = 0.01
-        self._cursor_step_frac_y = 0.04
+        self._cursor_step_frac_x = 0.002
+        self._cursor_step_frac_y = 0.008
         self._cursor_positions = {
             'v': [0.0, 0.0],  # x positions (X1, X2)
             'h': [-0.25, 0.25],  # y positions (Y1, Y2); initial default, will be reset
@@ -105,7 +105,8 @@ class PlotterWidget(QtWidgets.QWidget):
             line = Line2D([0, 0], [ymin, ymax], color=color, linestyle="--", linewidth=1.0, alpha=0.9)
             self.ax.add_line(line)
             self._cursor_lines_v.append(line)
-        for color in ["#d62728", "#1f77b4"]:
+        # Use neutral grays for Y cursors to avoid confusion with channel colors
+        for color in ["#4d4d4d", "#7f7f7f"]:
             line = Line2D([xmin, xmax], [0, 0], color=color, linestyle=":", linewidth=1.0, alpha=0.9)
             self.ax.add_line(line)
             self._cursor_lines_h.append(line)
