@@ -85,9 +85,26 @@ class PicoSDKError(RuntimeError):
     pass
 
 
+# Verbose logging controlled by env var PICO_VERBOSE (any non-empty value enables)
+_PICO_VERBOSE = bool(os.environ.get("PICO_VERBOSE", "").strip())
+
+
 def _check_status(status: int, where: str) -> None:
-    if int(status) != PICO_OK:
-        raise PicoSDKError(f"{where} failed: {_status_text(status)}")
+    code = int(status)
+    if _PICO_VERBOSE:
+        try:
+            msg = _status_text(status)
+        except Exception:
+            msg = str(status)
+        print(f"[PicoSDK] {where}: status={code} {msg}")
+    if code != PICO_OK:
+        # Always emit an error line before raising
+        try:
+            err = _status_text(status)
+        except Exception:
+            err = str(status)
+        print(f"[PicoSDK][ERROR] {where} failed: {err}")
+        raise PicoSDKError(f"{where} failed: {err}")
 
 
 @dataclass
@@ -108,6 +125,8 @@ class StreamConfig:
     trigger_source: int = PS5000A_CHANNEL_A  # Trigger source channel - Channel A
     trigger_threshold_pct: float = 0.1  # Trigger threshold as fraction of full scale (e.g., 0.1 = 10%)
     trigger_direction: int = 2  # Rising edge trigger
+    # Delay from trigger in samples (used both in device API and UI axis origin)
+    trigger_delay_samples: int = 0
 
 
 class PicoScopeStreamer:
@@ -171,6 +190,12 @@ class PicoScopeStreamer:
         self._bind_functions()
         # Trigger gating state for streaming: when enabled, suppress updates until first trigger
         self._seen_trigger: bool = False
+        # Per-trigger gating control: wait for trigger, then allow one window of post-delay samples
+        self._armed: bool = True
+        # When a trigger occurs, optionally hold off updates until delay elapses
+        self._gate_samples_remaining: int = 0
+        # After delay is satisfied, allow exactly one plot window worth of samples
+        self._post_window_remaining: int = 0
 
     def apply_trigger(self, enabled: bool, threshold_volts: float) -> None:
         self.cfg.simple_trigger_enabled = bool(enabled)
@@ -191,7 +216,7 @@ class PicoScopeStreamer:
                 c_int32(ch),
                 c_int16(counts),
                 c_int32(self.cfg.trigger_direction),
-                c_int32(0),
+                c_int32(int(max(0, self.cfg.trigger_delay_samples))),
                 c_int32(0),
             )
             _check_status(st, "ps5000aSetSimpleTrigger(enable)")
@@ -208,6 +233,43 @@ class PicoScopeStreamer:
             _check_status(st, "ps5000aSetSimpleTrigger(disable)")
         # Rearm trigger gating for streaming updates
         self._seen_trigger = False
+        self._gate_samples_remaining = 0
+        self._armed = True
+        self._post_window_remaining = 0
+
+    def set_trigger_delay_samples(self, delay_samples: int) -> int:
+        """Update trigger delay (in samples) and apply to device if trigger is enabled.
+
+        Returns the applied delay in samples.
+        """
+        self.cfg.trigger_delay_samples = int(max(0, delay_samples))
+        try:
+            if self.cfg.simple_trigger_enabled:
+                # Re-apply trigger settings to update delay parameter
+                ch = self.cfg.trigger_source
+                rng = self.cfg.range_a if ch == PS5000A_CHANNEL_A else self.cfg.range_b
+                full_scale_v = RANGE_TO_VOLTS.get(rng, 2.0)
+                max_adc = float(self.max_adc.value if self.max_adc.value != 0 else 32767)
+                counts = int(round(self.cfg.trigger_threshold_pct * max_adc)) if full_scale_v else 0
+                st = self.ps.ps5000aSetSimpleTrigger(
+                    self.handle,
+                    c_int16(1),
+                    c_int32(ch),
+                    c_int16(counts),
+                    c_int32(self.cfg.trigger_direction),
+                    c_int32(int(self.cfg.trigger_delay_samples)),
+                    c_int32(0),
+                )
+                _check_status(st, "ps5000aSetSimpleTrigger(update-delay)")
+        except Exception:
+            # Non-fatal if device rejects during streaming
+            pass
+        # Update time axis origin to start at delay
+        with self._lock:
+            origin_s = float(self.cfg.trigger_delay_samples) * float(self._dt_s)
+            window_s = self.cfg.plot_window_ms * 1e-3
+            self._t = np.linspace(origin_s, origin_s + window_s - self._dt_s, self._ring_len, dtype=np.float64)
+        return int(self.cfg.trigger_delay_samples)
 
     def _bind_functions(self) -> None:
         from ctypes import c_char_p
@@ -388,13 +450,50 @@ class PicoScopeStreamer:
         n = int(noOfSamples)
         if n <= 0:
             return
-        # If simple trigger is enabled, freeze updates until the first trigger occurs
-        if self.cfg.simple_trigger_enabled and not self._seen_trigger:
-            if int(triggered) == 0:
-                return
-            # First trigger observed; allow updates from now on
-            self._seen_trigger = True
         idx = int(startIndex)
+        # Handle trigger gating with optional delay and one-window capture
+        if self.cfg.simple_trigger_enabled:
+            if self._armed:
+                # Waiting for a new trigger; require a trigger in this buffer
+                if int(triggered) == 0:
+                    return
+                # Trigger observed: compute delay handling within this callback
+                self._armed = False
+                D = int(max(0, self.cfg.trigger_delay_samples))
+                tr_at = int(triggerAt)
+                skip = tr_at + D
+                if skip >= n:
+                    # Not enough samples after delay in this buffer; carry skip forward
+                    self._gate_samples_remaining = skip - n
+                    self._post_window_remaining = int(self._ring_len)
+                    return
+                # Skip up to trigger point + delay within this buffer
+                idx += skip
+                n = max(0, n - skip)
+                self._gate_samples_remaining = 0
+                self._post_window_remaining = int(self._ring_len)
+                if n <= 0:
+                    return
+            # If we still need to skip samples to satisfy the delay, do so
+            if self._gate_samples_remaining > 0:
+                if self._gate_samples_remaining >= n:
+                    self._gate_samples_remaining -= n
+                    return
+                idx += self._gate_samples_remaining
+                n -= self._gate_samples_remaining
+                self._gate_samples_remaining = 0
+                if n <= 0:
+                    return
+            # Enforce one-window capture after trigger+delay
+            if self._post_window_remaining > 0:
+                consume = min(n, self._post_window_remaining)
+                # Limit end by consume
+                n = consume
+                self._post_window_remaining -= consume
+            else:
+                # Already consumed the window; re-arm and freeze until next trigger
+                self._armed = True
+                return
         max_adc = float(self.max_adc.value if self.max_adc.value != 0 else 32767)
         scale_a = RANGE_TO_VOLTS.get(self.cfg.range_a, 2.0) / max_adc
         scale_b = RANGE_TO_VOLTS.get(self.cfg.range_b, 2.0) / max_adc
@@ -461,7 +560,8 @@ class PicoScopeStreamer:
             self._y_a = np.zeros(self._ring_len, dtype=np.float32)
             self._y_b = np.zeros(self._ring_len, dtype=np.float32)
             self._write_idx = 0
-            self._t = np.linspace(0.0, window_s - self._dt_s, self._ring_len, dtype=np.float64)
+            origin_s = float(self.cfg.trigger_delay_samples) * float(self._dt_s)
+            self._t = np.linspace(origin_s, origin_s + window_s - self._dt_s, self._ring_len, dtype=np.float64)
         return int(self.cfg.sample_interval_ns)
 
     def reconfigure_window_ms(self, new_window_ms: float) -> float:
@@ -475,5 +575,6 @@ class PicoScopeStreamer:
             self._y_a = np.zeros(self._ring_len, dtype=np.float32)
             self._y_b = np.zeros(self._ring_len, dtype=np.float32)
             self._write_idx = 0
-            self._t = np.linspace(0.0, window_s - dt_s, self._ring_len, dtype=np.float64)
+            origin_s = float(self.cfg.trigger_delay_samples) * float(dt_s)
+            self._t = np.linspace(origin_s, origin_s + window_s - dt_s, self._ring_len, dtype=np.float64)
         return float(self.cfg.plot_window_ms)
