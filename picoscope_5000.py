@@ -99,8 +99,24 @@ class MainWindow(QtWidgets.QMainWindow):
         # Initialize internal trigger level (volts) from config and current trigger source range
         init_rng = self.cfg.range_a if self.cfg.trigger_source == PS5000A_CHANNEL_A else self.cfg.range_b
         self._trigger_level_v = float(self.cfg.trigger_threshold_pct * RANGE_TO_VOLTS.get(init_rng, 2.0))
+        # Initialize delay from trigger (seconds)
+        self._trigger_delay_s: float = float(getattr(self.cfg, 'trigger_delay_samples', 0)) * float(self.cfg.sample_interval_ns * 1e-9)
         # Wire event
         self.trigger_chk.toggled.connect(self._apply_trigger_ui)
+
+        # Delay from trigger controls
+        hbox.addSpacing(10)
+        hbox.addWidget(QtWidgets.QLabel("Delay:"))
+        self.delay_dec_btn = QtWidgets.QPushButton("−")
+        self.delay_inc_btn = QtWidgets.QPushButton("+")
+        self.delay_dec_btn.setFixedWidth(30)
+        self.delay_inc_btn.setFixedWidth(30)
+        self.delay_dec_btn.setToolTip("Decrease delay from trigger")
+        self.delay_inc_btn.setToolTip("Increase delay from trigger")
+        self.delay_dec_btn.clicked.connect(lambda: self._on_delay_nudge(-1))
+        self.delay_inc_btn.clicked.connect(lambda: self._on_delay_nudge(1))
+        hbox.addWidget(self.delay_dec_btn)
+        hbox.addWidget(self.delay_inc_btn)
 
         # Timebase +/- buttons (discrete window sizes)
         hbox.addSpacing(20)
@@ -232,6 +248,12 @@ class MainWindow(QtWidgets.QMainWindow):
             fs_v = RANGE_TO_VOLTS.get(rng, 1.0)
             norm_y = (self._trigger_level_v / fs_v) if fs_v else 0.0
             self.plotter.set_trigger_level_norm(norm_y)
+            # Apply initial delay to driver time axis
+            try:
+                init_delay_samples = int(round(self._trigger_delay_s / (actual_ns * 1e-9)))
+                self.streamer.set_trigger_delay_samples(init_delay_samples)
+            except Exception:
+                pass
         except Exception as e:
             print(f"Error during initialization: {e}")
             self.streamer = None
@@ -558,6 +580,30 @@ class MainWindow(QtWidgets.QMainWindow):
             self.lbl_trig.setText(f"{self._trigger_level_v:+.3f} V")
         except Exception:
             pass
+
+    def _on_delay_nudge(self, direction: int) -> None:
+        # Adjust delay from trigger; reflect on driver and axis origin
+        try:
+            window_s = float(self.cfg.plot_window_ms) * 1e-3
+            step_s = 0.02 * window_s  # 2% of window per nudge
+            new_delay_s = max(0.0, self._trigger_delay_s + float(direction) * step_s)
+            self._trigger_delay_s = float(new_delay_s)
+            if self.streamer:
+                dt_s = float(self.streamer.cfg.sample_interval_ns) * 1e-9
+                delay_samples = int(round(self._trigger_delay_s / dt_s))
+                # Update driver (also re-arms gating)
+                self.streamer.set_trigger_delay_samples(delay_samples)
+                # Keep axis formatter in sync
+                self._apply_time_axis_format(self.cfg.plot_window_ms * 1e-3)
+                self.status_lbl.setText(f"Status: Delay {self._format_time(self._trigger_delay_s)}")
+            else:
+                # No hardware; update config and axis only
+                dt_s = float(self.cfg.sample_interval_ns) * 1e-9
+                delay_samples = int(round(self._trigger_delay_s / dt_s))
+                setattr(self.cfg, 'trigger_delay_samples', delay_samples)
+                self._apply_time_axis_format(self.cfg.plot_window_ms * 1e-3)
+        except Exception as e:
+            self.status_lbl.setText(f"Status: Delay change failed — {e}")
 
 
 def picoscope_5000() -> int:
