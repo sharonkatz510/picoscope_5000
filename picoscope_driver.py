@@ -92,22 +92,22 @@ def _check_status(status: int, where: str) -> None:
 
 @dataclass
 class StreamConfig:
-    sample_interval_ns: int = 1000
-    plot_refresh_ms: int = 20
-    plot_window_ms: float = 20.0
-    plot_max_points: int = 6000
+    sample_interval_ns: int = 1000 # 1 µs between acquisitions
+    plot_refresh_ms: int = 20   # Refresh plot every 20 ms
+    plot_window_ms: float = 20.0    # Initial plot window size in ms
+    plot_max_points: int = 6000   # Max points to plot
 
-    range_a: int = PS5000A_2V
-    range_b: int = PS5000A_2V
-    coupling: int = PS5000A_DC
-    resolution: int = PS5000A_DR_8BIT
+    range_a: int = PS5000A_2V   # Channel A initial range - 2 V
+    range_b: int = PS5000A_2V   # Channel B initial range - 2 V
+    coupling: int = PS5000A_AC   # AC coupling
+    resolution: int = PS5000A_DR_8BIT   # 8-bit resolution
 
-    driver_buffer_size: int = 200_000
-    connect_delay_ms: int = 1000
-    simple_trigger_enabled: bool = False
-    trigger_source: int = PS5000A_CHANNEL_A
-    trigger_threshold_pct: float = 0.1
-    trigger_direction: int = 2
+    driver_buffer_size: int = 200_000   # Driver buffer size - memory pre-allocated
+    connect_delay_ms: int = 1000   # Delay from connecting to starting acquisition in ms
+    simple_trigger_enabled: bool = False    # Simple trigger enabled
+    trigger_source: int = PS5000A_CHANNEL_A  # Trigger source channel - Channel A
+    trigger_threshold_pct: float = 0.1  # Trigger threshold as fraction of full scale (e.g., 0.1 = 10%)
+    trigger_direction: int = 2  # Rising edge trigger
 
 
 class PicoScopeStreamer:
