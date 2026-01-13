@@ -10,6 +10,15 @@ This app connects to PicoScope 5000 series hardware using the `ps5000a` driver (
 - Keeps a rolling window buffer (default 20 ms) and refreshes the plot every 20 ms.
 - Normalizes the plotted amplitude by the selected full-scale range for each channel (y-axis spans ±0.5 by default).
 
+## Modules
+
+- [picoscope_5000.py](picoscope_5000.py): Main UI/controller. Builds the PyQt5 interface, wires callbacks, formats the time axis, updates the plot, and manages cursor readouts via the plot widget. Delegates hardware actions to the streamer.
+- [picoscope_driver.py](picoscope_driver.py): Hardware streaming driver wrapper over PicoSDK (`ps5000a.dll`). Opens/closes the device, configures channels/ranges, applies trigger, and streams data into ring buffers. Exposes `StreamConfig` and `PicoScopeStreamer`.
+- [plotter.py](plotter.py): Plotting and cursor management. Embeds Matplotlib in a Qt widget, renders channels A/B, and provides two X cursors and two Y cursors with movement and readouts.
+- [picoscope_constants.py](picoscope_constants.py): Centralized PicoSDK enums, range maps/labels, and status codes. Also loads optional status text overrides from JSON.
+- [pico_status_dict.json](pico_status_dict.json): Optional map of Pico status codes to human-readable strings; merged into the defaults on startup.
+- [requirements.txt](requirements.txt): Python dependencies for the app.
+
 ## Requirements
 
 ### PicoSDK and DLLs
@@ -65,9 +74,9 @@ On startup the app attempts to open the first available scope, configures it, an
 - Trigger: Checkbox enables/disables a simple rising-edge trigger. Enter level in volts; it converts to device counts based on the selected range.
 - Timebase window: Buttons `−` and `+` step the rolling window through predefined durations (10 µs … 10 ms). A spin box allows precise window control (0.010 ms … 10.000 ms).
 
-## Configuration (`StreamConfig`)
+## Configuration (Driver `StreamConfig`)
 
-Edit `StreamConfig` in the code for defaults:
+Edit `StreamConfig` in [picoscope_driver.py](picoscope_driver.py) for defaults:
 - `sample_interval_ns`: requested sample interval in ns (default 1000 ns = 1 µs)
 - `plot_refresh_ms`: GUI refresh period (default 20 ms)
 - `plot_window_ms`: rolling window duration (default 20.0 ms)

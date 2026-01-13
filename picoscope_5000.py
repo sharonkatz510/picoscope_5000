@@ -12,743 +12,26 @@ Tested approach: follows the ps5000aRunStreaming + ps5000aGetStreamingLatestValu
 
 from __future__ import annotations
 
-import os
 import sys
-import threading
-import time
-import ctypes
-import json
-from ctypes import (
-    byref, c_int16, c_int32, c_uint32, c_float, c_double, c_int8, c_void_p,
-    POINTER, WINFUNCTYPE
-)
-from ctypes.util import find_library
-from dataclasses import dataclass
 
 import numpy as np
 
 from PyQt5 import QtCore, QtWidgets
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib import ticker as mticker
-from matplotlib.figure import Figure
-
-
-# -----------------------------
-# PicoSDK / ps5000a constants
-# -----------------------------
-
-# Channels (enum order from PS5000A_CHANNEL)
-PS5000A_CHANNEL_A = 0
-PS5000A_CHANNEL_B = 1
-
-# Coupling (enum order from PS5000A_COUPLING)
-PS5000A_AC = 0
-PS5000A_DC = 1
-
-# Ranges (enum order from PS5000A_RANGE)
-PS5000A_10MV = 0
-PS5000A_20MV = 1
-PS5000A_50MV = 2
-PS5000A_100MV = 3
-PS5000A_200MV = 4
-PS5000A_500MV = 5
-PS5000A_1V = 6
-PS5000A_2V = 7
-PS5000A_5V = 8
-PS5000A_10V = 9
-PS5000A_20V = 10
-
-RANGE_TO_VOLTS = {
-    PS5000A_10MV: 0.010,
-    PS5000A_20MV: 0.020,
-    PS5000A_50MV: 0.050,
-    PS5000A_100MV: 0.100,
-    PS5000A_200MV: 0.200,
-    PS5000A_500MV: 0.500,
-    PS5000A_1V: 1.0,
-    PS5000A_2V: 2.0,
-    PS5000A_5V: 5.0,
-    PS5000A_10V: 10.0,
-    PS5000A_20V: 20.0,
-}
-
-# Ordered list of ranges for cycling via GUI
-RANGE_CODES = [
-    PS5000A_10MV,
-    PS5000A_20MV,
-    PS5000A_50MV,
-    PS5000A_100MV,
-    PS5000A_200MV,
-    PS5000A_500MV,
-    PS5000A_1V,
-    PS5000A_2V,
-    PS5000A_5V,
-    PS5000A_10V,
-    PS5000A_20V,
-]
-
-RANGE_LABELS = {
-    PS5000A_10MV: "10 mV",
-    PS5000A_20MV: "20 mV",
-    PS5000A_50MV: "50 mV",
-    PS5000A_100MV: "100 mV",
-    PS5000A_200MV: "200 mV",
-    PS5000A_500MV: "500 mV",
-    PS5000A_1V: "1 V",
-    PS5000A_2V: "2 V",
-    PS5000A_5V: "5 V",
-    PS5000A_10V: "10 V",
-    PS5000A_20V: "20 V",
-}
-
-# Time units (enum order from PS5000A_TIME_UNITS)
-PS5000A_FS = 0
-PS5000A_PS = 1
-PS5000A_NS = 2
-PS5000A_US = 3
-PS5000A_MS = 4
-PS5000A_S = 5
-
-# Ratio modes (enum order from PS5000A_RATIO_MODE)
-PS5000A_RATIO_MODE_NONE = 0
-PS5000A_RATIO_MODE_AGGREGATE = 1
-PS5000A_RATIO_MODE_DECIMATE = 2
-PS5000A_RATIO_MODE_AVERAGE = 4
-
-# Resolution (enum order from PS5000A_DEVICE_RESOLUTION)
-PS5000A_DR_8BIT = 0
-PS5000A_DR_12BIT = 1
-PS5000A_DR_14BIT = 2
-PS5000A_DR_15BIT = 3
-PS5000A_DR_16BIT = 4
-
-# Status codes: PicoStatus.h defines many.
-PICO_OK = 0x00000000
-# Selected codes from PicoStatus.h (exact values):
-# Power status codes returned by ps5000aOpenUnit
-PICO_POWER_SUPPLY_CONNECTED = 0x00000119
-PICO_POWER_SUPPLY_NOT_CONNECTED = 0x0000011A
-# Common error codes
-PICO_INVALID_HANDLE = 0x0000000C
-PICO_INVALID_PARAMETER = 0x0000000D
-PICO_INVALID_TIMEBASE = 0x0000000E
-
-STATUS_TEXT = {
-    PICO_OK: "OK",
-    PICO_POWER_SUPPLY_NOT_CONNECTED: "Power supply not connected",
-    PICO_POWER_SUPPLY_CONNECTED: "Power supply connected (change required)",
-    PICO_INVALID_PARAMETER: "Invalid parameter",
-    PICO_INVALID_TIMEBASE: "Invalid timebase",
-    PICO_INVALID_HANDLE: "Invalid handle",
-}
-
-def _status_text(code: int) -> str:
-    return STATUS_TEXT.get(int(code), f"Unknown status 0x{int(code):08X}")
-
-def _load_status_texts_from_file() -> None:
-    """Load additional status messages from pico_status_dict.json in the same folder."""
-    try:
-        here = os.path.dirname(__file__)
-        path = os.path.join(here, "pico_status_dict.json")
-        if not os.path.isfile(path):
-            return
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for k, v in data.items():
-            try:
-                if isinstance(k, str) and k.lower().startswith("0x"):
-                    ik = int(k, 16)
-                else:
-                    ik = int(k)
-                STATUS_TEXT[ik] = str(v)
-            except Exception:
-                continue
-    except Exception:
-        # Non-fatal: keep built-in minimal map
-        pass
-
-_load_status_texts_from_file()
-
-
-def _find_ps5000a_dll() -> str:
-    """
-    Find ps5000a.dll.
-    Priority:
-    1) PICO_PS5000A_DLL environment variable (full path)
-    2) common PicoSDK install locations
-    3) PATH search / find_library
-    """
-    env_path = os.environ.get("PICO_PS5000A_DLL", "").strip()
-    if env_path and os.path.isfile(env_path):
-        return env_path
-
-    candidates = [
-        r"C:\Program Files\Pico Technology\SDK\lib\ps5000a.dll",
-        r"C:\Program Files\Pico Technology\PicoScope 7 T&M Stable\ps5000a.dll",
-        r"C:\Program Files\Pico Technology\PicoScope 6\ps5000a.dll",
-        r"C:\Program Files\Pico Technology\PicoScope6\ps5000a.dll",
-        r"C:\Program Files (x86)\Pico Technology\SDK\lib\ps5000a.dll",
-        r"C:\Program Files (x86)\Pico Technology\PicoScope 6\ps5000a.dll",
-        r"C:\Program Files (x86)\Pico Technology\PicoScope6\ps5000a.dll",
-    ]
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
-
-    lib = find_library("ps5000a")
-    if lib:
-        return lib
-
-    raise FileNotFoundError(
-        "Could not find ps5000a.dll. Install PicoSDK, or set env var PICO_PS5000A_DLL to the full path."
-    )
-
-
-class PicoSDKError(RuntimeError):
-    pass
-
-
-def _check_status(status: int, where: str) -> None:
-    if int(status) != PICO_OK:
-        raise PicoSDKError(f"{where} failed: {_status_text(status)}")
-
-
-# -----------------------------
-# PicoScope streaming wrapper
-# -----------------------------
-
-@dataclass
-class StreamConfig:
-    # 20 MHz sampling -> 50 ns sample interval
-    sample_interval_ns: int = 1000
-
-    # Plot refresh period and plot window
-    plot_refresh_ms: int = 20          # GUI refresh
-    plot_window_ms: float = 20.0       # rolling buffer shown in plot (ms)
-
-    # Display decimation (keep full buffer internally, plot fewer points)
-    plot_max_points: int = 6000
-
-    range_a: int = PS5000A_2V
-    range_b: int = PS5000A_2V
-    coupling: int = PS5000A_DC
-    resolution: int = PS5000A_DR_8BIT
-
-    # Driver overview buffer size - this is the chunk size the driver fills per callback
-    # Make it large enough to reduce callback overhead at high rates.
-    driver_buffer_size: int = 200_000
-    # Delay after opening scope for USB/device to settle (ms)
-    connect_delay_ms: int = 1000
-    # Trigger configuration (simple trigger); disabled by default
-    simple_trigger_enabled: bool = False
-    trigger_source: int = PS5000A_CHANNEL_A
-    trigger_threshold_pct: float = 0.1  # fraction of full scale
-    trigger_direction: int = 2  # rising (SDK enum typical)
-
-
-class PicoScopeStreamer:
-    def __init__(self, cfg: StreamConfig):
-        self.cfg = cfg
-        self._dll_path = _find_ps5000a_dll()
-        # Ensure Windows can locate dependent PicoSDK DLLs (e.g., picoipp.dll)
-        self._dll_dir_ctx = None
-        try:
-            if hasattr(os, "add_dll_directory"):
-                # Add the directory containing ps5000a.dll
-                self._dll_dir_ctx = os.add_dll_directory(os.path.dirname(self._dll_path))
-                # Add common PicoSDK lib directories for dependencies like picoipp.dll
-                candidate_dirs = [
-                    r"C:\\Program Files\\Pico Technology\\SDK\\lib",
-                    r"C:\\Program Files\\Pico Technology\\SDK\\lib\\win64",
-                    r"C:\\Program Files\\Pico Technology\\SDK\\lib\\win32",
-                    r"C:\\Program Files (x86)\\Pico Technology\\SDK\\lib",
-                    r"C:\\Program Files (x86)\\Pico Technology\\SDK\\lib\\win64",
-                    r"C:\\Program Files (x86)\\Pico Technology\\SDK\\lib\\win32",
-                ]
-                for d in candidate_dirs:
-                    if os.path.isdir(d):
-                        os.add_dll_directory(d)
-        except Exception:
-            pass
-        # Preload picoipp.dll from the same directory if present
-        try:
-            sdk_dir = os.path.dirname(self._dll_path)
-            picoipp_path = os.path.join(sdk_dir, "picoipp.dll")
-            if os.path.isfile(picoipp_path):
-                ctypes.WinDLL(picoipp_path)
-        except Exception:
-            # If preload fails, WinDLL(ps5000a.dll) may still succeed if PATH is set
-            pass
-        self.ps = ctypes.WinDLL(self._dll_path)
-
-        self.handle = c_int16(0)
-        self.max_adc = c_int16(0)
-
-        # Driver buffers (raw ADC counts)
-        self._buf_a = (c_int16 * cfg.driver_buffer_size)()
-        self._buf_b = (c_int16 * cfg.driver_buffer_size)()
-
-        # Ring buffers (volts) for plotting - 20 ms rolling window at 20 MHz = 400k samples
-        self._lock = threading.Lock()
-        self._running = False
-        self._thread: threading.Thread | None = None
-
-        self._dt_s = cfg.sample_interval_ns * 1e-9
-        self._ring_len = int(round((cfg.plot_window_ms * 1e-3) / self._dt_s))
-        if self._ring_len < 10:
-            self._ring_len = 10
-
-        self._y_a = np.zeros(self._ring_len, dtype=np.float32)
-        self._y_b = np.zeros(self._ring_len, dtype=np.float32)
-        self._write_idx = 0
-
-        # Precompute time axis for the rolling window
-        window_s = cfg.plot_window_ms * 1e-3
-        self._t = np.linspace(0.0, window_s - self._dt_s, self._ring_len, dtype=np.float64)
-
-        # Callbacks and event
-        # Block-ready for block mode
-        self._block_ready_type = WINFUNCTYPE(None, c_int16, c_uint32, c_void_p)
-        self._block_ready_cb = self._block_ready_type(self._on_block_ready)
-        # Streaming-ready for streaming mode
-        self._streaming_ready_type = WINFUNCTYPE(None, c_int16, c_int32, c_uint32, c_int16, c_uint32, c_int16, c_int16, c_void_p)
-        self._streaming_cb = self._streaming_ready_type(self._on_streaming_ready)
-        self._ready_evt = threading.Event()
-
-        self._bind_functions()
-
-    def apply_trigger(self, enabled: bool, threshold_volts: float) -> None:
-        # Configure simple trigger for streaming/block per current settings
-        self.cfg.simple_trigger_enabled = bool(enabled)
-        # Assume trigger on channel A for now (cfg.trigger_source)
-        ch = self.cfg.trigger_source
-        rng = self.cfg.range_a if ch == PS5000A_CHANNEL_A else self.cfg.range_b
-        full_scale_v = RANGE_TO_VOLTS.get(rng, 2.0)
-        max_adc = float(self.max_adc.value if self.max_adc.value != 0 else 32767)
-        # Store as fraction of full scale for consistency
-        self.cfg.trigger_threshold_pct = float(threshold_volts) / float(full_scale_v) if full_scale_v else 0.0
-        # Convert volts to ADC counts (signed), clamp to device limits
-        counts = int(round((threshold_volts / full_scale_v) * max_adc)) if full_scale_v else 0
-        if counts > int(max_adc):
-            counts = int(max_adc)
-        if counts < -int(max_adc):
-            counts = -int(max_adc)
-        print(f"Trigger {'ENABLED' if enabled else 'DISABLED'}: {threshold_volts:.6f} V (rising), counts {counts}")
-        if enabled:
-            st = self.ps.ps5000aSetSimpleTrigger(
-                self.handle,
-                c_int16(1),
-                c_int32(ch),
-                c_int16(counts),
-                c_int32(self.cfg.trigger_direction),
-                c_int32(0),
-                c_int32(0),
-            )
-            _check_status(st, "ps5000aSetSimpleTrigger(enable)")
-        else:
-            st = self.ps.ps5000aSetSimpleTrigger(
-                self.handle,
-                c_int16(0),
-                c_int32(ch),
-                c_int16(0),
-                c_int32(self.cfg.trigger_direction),
-                c_int32(0),
-                c_int32(0),
-            )
-            _check_status(st, "ps5000aSetSimpleTrigger(disable)")
-
-    def _bind_functions(self) -> None:
-        # ps5000aOpenUnit(handle*, serial*, resolution)
-        # serial is int8_t* (C char*); use c_char_p for NULL or ASCII serial
-        from ctypes import c_char_p
-        self.ps.ps5000aOpenUnit.argtypes = [POINTER(c_int16), c_char_p, c_int32]
-        self.ps.ps5000aOpenUnit.restype = c_int32
-
-        # ps5000aOpenUnitProgress(handle*, serial*, progress*, complete*, resolution)
-        # progress/complete are int16* that indicate connection status
-        self.ps.ps5000aOpenUnitProgress.argtypes = [POINTER(c_int16), c_char_p, POINTER(c_int16), POINTER(c_int16), c_int32]
-        self.ps.ps5000aOpenUnitProgress.restype = c_int32
-
-        # ps5000aCloseUnit(handle)
-        self.ps.ps5000aCloseUnit.argtypes = [c_int16]
-        self.ps.ps5000aCloseUnit.restype = c_int32
-
-        # ps5000aSetChannel(handle, channel, enabled, type, range, analogueOffset)
-        self.ps.ps5000aSetChannel.argtypes = [c_int16, c_int32, c_int16, c_int32, c_int32, c_float]
-        self.ps.ps5000aSetChannel.restype = c_int32
-
-        # ps5000aSetDataBuffers(handle, channel, bufferMax, bufferMin, bufferLth, segmentIndex, ratioMode)
-        self.ps.ps5000aSetDataBuffers.argtypes = [c_int16, c_int32, POINTER(c_int16), POINTER(c_int16), c_int32, c_uint32, c_int32]
-        self.ps.ps5000aSetDataBuffers.restype = c_int32
-        # ps5000aSetDataBuffer(handle, channel, buffer, bufferLth, segmentIndex, ratioMode)
-        self.ps.ps5000aSetDataBuffer.argtypes = [c_int16, c_int32, POINTER(c_int16), c_int32, c_uint32, c_int32]
-        self.ps.ps5000aSetDataBuffer.restype = c_int32
-
-        # ps5000aRunStreaming(handle, sampleInterval*, timeUnits, maxPre, maxPost, autoStop, downSampleRatio, ratioMode, overviewBufferSize)
-        self.ps.ps5000aRunStreaming.argtypes = [
-            c_int16, POINTER(c_uint32), c_int32, c_uint32, c_uint32, c_int16, c_uint32, c_int32, c_uint32
-        ]
-        self.ps.ps5000aRunStreaming.restype = c_int32
-
-        # ps5000aGetStreamingLatestValues(handle, callback, pParameter)
-        self.ps.ps5000aGetStreamingLatestValues.argtypes = [c_int16, c_void_p, c_void_p]
-        self.ps.ps5000aGetStreamingLatestValues.restype = c_int32
-
-        # ps5000aStop(handle)
-        self.ps.ps5000aStop.argtypes = [c_int16]
-        self.ps.ps5000aStop.restype = c_int32
-
-        # ps5000aMaximumValue(handle, value*)
-        self.ps.ps5000aMaximumValue.argtypes = [c_int16, POINTER(c_int16)]
-        self.ps.ps5000aMaximumValue.restype = c_int32
-
-        # Memory segments (ensure a valid segment index exists)
-        # ps5000aMemorySegments(handle, nSegments, maxSamples*)
-        self.ps.ps5000aMemorySegments.argtypes = [c_int16, c_uint32, POINTER(c_uint32)]
-        self.ps.ps5000aMemorySegments.restype = c_int32
-
-        # Rapid block captures count (ensure a valid captures setting)
-        # ps5000aSetNoOfCaptures(handle, nCaptures)
-        self.ps.ps5000aSetNoOfCaptures.argtypes = [c_int16, c_uint32]
-        self.ps.ps5000aSetNoOfCaptures.restype = c_int32
-
-        # ps5000aChangePowerSource(handle, powerStatus)
-        self.ps.ps5000aChangePowerSource.argtypes = [c_int16, c_uint32]
-        self.ps.ps5000aChangePowerSource.restype = c_int32
-        # ps5000aCurrentPowerSource(handle)
-        self.ps.ps5000aCurrentPowerSource.argtypes = [c_int16]
-        self.ps.ps5000aCurrentPowerSource.restype = c_int32
-
-        # Block-mode APIs
-        self.ps.ps5000aGetTimebase2.argtypes = [c_int16, c_uint32, c_int32, POINTER(c_float), c_int16, c_uint32]
-        self.ps.ps5000aGetTimebase2.restype = c_int32
-        self.ps.ps5000aRunBlock.argtypes = [c_int16, c_int32, c_int32, c_uint32, c_int16, POINTER(c_int32), c_int32, c_void_p, c_void_p]
-        self.ps.ps5000aRunBlock.restype = c_int32
-        self.ps.ps5000aGetValues.argtypes = [c_int16, c_uint32, POINTER(c_uint32), c_uint32, c_int32, c_uint32, POINTER(c_int16)]
-        self.ps.ps5000aGetValues.restype = c_int32
-
-        self._max_samples_per_segment = c_uint32(0)
-
-        # Simple trigger (optional)
-        self.ps.ps5000aSetSimpleTrigger.argtypes = [c_int16, c_int16, c_int32, c_int16, c_int32, c_int32, c_int32]
-        self.ps.ps5000aSetSimpleTrigger.restype = c_int32
-
-        # Poll (unused)
-        self.ps.ps5000aIsReady.argtypes = [c_int16, POINTER(c_int16)]
-        self.ps.ps5000aIsReady.restype = c_int32
-
-        # Minimum timebase (stateless): helps detect too-high requested sampling
-        # ps5000aGetMinimumTimebaseStateless(handle, enabledChannelOrPortFlags, timebase*, timeInterval*, resolution)
-        self.ps.ps5000aGetMinimumTimebaseStateless.argtypes = [c_int16, c_uint32, POINTER(c_uint32), POINTER(c_double), c_uint32]
-        self.ps.ps5000aGetMinimumTimebaseStateless.restype = c_int32
-
-        # Block-mode APIs
-        # ps5000aGetTimebase2(handle, timebase, noSamples, timeIntervalNanoseconds*, oversample, segmentIndex)
-        self.ps.ps5000aGetTimebase2.argtypes = [c_int16, c_uint32, c_int32, POINTER(c_float), c_int16, c_uint32]
-        self.ps.ps5000aGetTimebase2.restype = c_int32
-
-        # ps5000aRunBlock(handle, preTrig, postTrig, timebase, oversample, timeIndisposedMs*, segmentIndex, lpReady, pParameter)
-        self.ps.ps5000aRunBlock.argtypes = [c_int16, c_int32, c_int32, c_uint32, c_int16, POINTER(c_int32), c_uint32, c_void_p, c_void_p]
-        self.ps.ps5000aRunBlock.restype = c_int32
-
-        # ps5000aGetValues(handle, startIndex, noOfSamples*, downSampleRatio, ratioMode, segmentIndex, overflow*)
-        self.ps.ps5000aGetValues.argtypes = [c_int16, c_uint32, POINTER(c_uint32), c_uint32, c_int32, c_uint32, POINTER(c_int16)]
-        self.ps.ps5000aGetValues.restype = c_int32
-
-    def open(self) -> None:
-        print("Step 1: Opening unit (OpenUnit)...")
-        serial_p = ctypes.c_char_p(None)  # open first scope found
-
-        # Try preferred then fallback resolutions
-        res = PS5000A_DR_8BIT
-        last_err: int | None = None
-        status = self.ps.ps5000aOpenUnit(byref(self.handle), serial_p, c_int32(res))
-        code = int(status)
-        if code == PICO_OK:
-            self.cfg.resolution = res
-            print(f"Step 1: Unit opened at resolution {res}")
-        if code in (PICO_POWER_SUPPLY_NOT_CONNECTED, PICO_POWER_SUPPLY_CONNECTED):
-            print(f"Step 1: { _status_text(code) }; changing power source...")
-            # Inform device of current supply state per returned code
-            ps = self.ps.ps5000aChangePowerSource(self.handle, c_uint32(code))
-            ps_code = int(ps)
-            if ps_code != PICO_OK:
-                last_err = ps_code
-                print(f"Step 1: ChangePowerSource failed: { _status_text(ps_code) }")
-            else:
-                self.cfg.resolution = res
-                print(f"Step 1: Unit opened after power change at resolution {res}")
-        status = self.ps.ps5000aMaximumValue(self.handle, byref(self.max_adc))
-        _check_status(status, "ps5000aMaximumValue")
-
-        # In standard block mode, segmentation is not required. Some variants allow calling
-        # MemorySegments for rapid block; we skip it here to avoid mode conflicts.
-        self._max_samples_per_segment = c_uint32(0)
-
-        # Configure channels A and B
-        print("Step 2: Configuring channels and coupling (SetChannel)...")
-        status = self.ps.ps5000aSetChannel(self.handle, PS5000A_CHANNEL_A, 1, self.cfg.coupling, self.cfg.range_a, c_float(0.0))
-        _check_status(status, "ps5000aSetChannel(A)")
-        status = self.ps.ps5000aSetChannel(self.handle, PS5000A_CHANNEL_B, 1, self.cfg.coupling, self.cfg.range_b, c_float(0.0))
-        _check_status(status, "ps5000aSetChannel(B)")
-
-        # Ensure a valid memory segment exists for block-mode acquisitions
-        print("Step 3: Initializing memory segments (1 segment)...")
-        self._max_samples_per_segment = c_uint32(0)
-        status = self.ps.ps5000aMemorySegments(self.handle, c_uint32(1), byref(self._max_samples_per_segment))
-        _check_status(status, "ps5000aMemorySegments(1)")
-        status = self.ps.ps5000aSetNoOfCaptures(self.handle, c_uint32(1))
-        _check_status(status, "ps5000aSetNoOfCaptures(1)")
-
-        # Step 4: Simple trigger setup (optional)
-        if self.cfg.simple_trigger_enabled:
-            print("Step 4: Setting simple trigger (SetSimpleTrigger)...")
-            thresh_counts = int(self.max_adc.value * self.cfg.trigger_threshold_pct)
-            st = self.ps.ps5000aSetSimpleTrigger(
-                self.handle,
-                c_int16(1),
-                c_int32(self.cfg.trigger_source),
-                c_int16(thresh_counts),
-                c_int32(self.cfg.trigger_direction),
-                c_int32(0),
-                c_int32(0)
-            )
-            _check_status(st, "ps5000aSetSimpleTrigger")
-        else:
-            print("Step 4: Simple trigger disabled")
-
-        # Step 7: Set data buffers (outside acquisition loop)
-        print("Step 7: Setting data buffers (SetDataBuffer, raw mode)...")
-        # Use SetDataBuffer for raw ADC samples (no aggregation)
-        status = self.ps.ps5000aSetDataBuffer(
-            self.handle, PS5000A_CHANNEL_A, self._buf_a, self.cfg.driver_buffer_size, 0, PS5000A_RATIO_MODE_NONE
-        )
-        _check_status(status, "ps5000aSetDataBuffer(A)")
-        status = self.ps.ps5000aSetDataBuffer(
-            self.handle, PS5000A_CHANNEL_B, self._buf_b, self.cfg.driver_buffer_size, 0, PS5000A_RATIO_MODE_NONE
-        )
-        _check_status(status, "ps5000aSetDataBuffer(B)")
-        # Allow some time for device/USB to settle before acquisitions
-        time.sleep(self.cfg.connect_delay_ms / 1000.0)
-
-    def set_range(self, channel: int, new_range: int) -> None:
-        # Update device channel range and local config
-        enabled = 1
-        status = self.ps.ps5000aSetChannel(
-            self.handle, channel, enabled, self.cfg.coupling, new_range, c_float(0.0)
-        )
-        _check_status(status, f"ps5000aSetChannel({'A' if channel==PS5000A_CHANNEL_A else 'B'})")
-        if channel == PS5000A_CHANNEL_A:
-            self.cfg.range_a = new_range
-        else:
-            self.cfg.range_b = new_range
-        # If trigger is enabled and tied to this channel, re-apply with same volts
-        if self.cfg.simple_trigger_enabled and channel == self.cfg.trigger_source:
-            rng = new_range
-            full_scale_v = RANGE_TO_VOLTS.get(rng, 2.0)
-            volts = self.cfg.trigger_threshold_pct * full_scale_v
-            try:
-                self.apply_trigger(True, volts)
-            except Exception:
-                pass
-
-    def start(self) -> None:
-        if self._running:
-            return
-        self._running = True
-
-        def _stream_loop():
-            # Configure and start streaming
-            sample_interval = c_uint32(max(1, self.cfg.sample_interval_ns))
-            time_units = PS5000A_NS
-            max_pre = c_uint32(0)
-            max_post = c_uint32(0)
-            auto_stop = c_int16(0)
-            downsample = c_uint32(1)
-            ratio_mode = PS5000A_RATIO_MODE_NONE
-            overview = c_uint32(self.cfg.driver_buffer_size)
-            print("Step 5: Starting streaming (RunStreaming)...")
-            st = self.ps.ps5000aRunStreaming(
-                self.handle,
-                byref(sample_interval),
-                c_int32(time_units),
-                max_pre,
-                max_post,
-                auto_stop,
-                downsample,
-                c_int32(ratio_mode),
-                overview
-            )
-            _check_status(st, "ps5000aRunStreaming")
-
-            while self._running:
-                # Fetch latest values via callback; driver fills our buffers
-                st2 = self.ps.ps5000aGetStreamingLatestValues(self.handle, self._streaming_cb, None)
-                if int(st2) != PICO_OK:
-                    # Non-fatal; continue
-                    pass
-                time.sleep(self.cfg.plot_refresh_ms / 1000.0)
-
-        self._thread = threading.Thread(target=_stream_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        if not self._running:
-            return
-        self._running = False
-        print("Step 11: Stopping oscilloscope (Stop)...")
-        try:
-            self.ps.ps5000aStop(self.handle)
-        except Exception:
-            pass
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=0.5)
-        self._thread = None
-
-    def close(self) -> None:
-        try:
-            self.stop()
-        finally:
-            try:
-                self.ps.ps5000aCloseUnit(self.handle)
-            except Exception:
-                pass
-
-    def _on_block_ready(self, handle: int, status: int, pParameter: int) -> None:
-        self._ready_evt.set()
-
-    def _on_streaming_ready(self, handle: int, noOfSamples: int, startIndex: int, overflow: int, triggerAt: int, triggered: int, autoStop: int, pParameter: int) -> None:
-        # Convert newly received samples to volts and update rolling window
-        n = int(noOfSamples)
-        if n <= 0:
-            return
-        idx = int(startIndex)
-        max_adc = float(self.max_adc.value if self.max_adc.value != 0 else 32767)
-        scale_a = RANGE_TO_VOLTS.get(self.cfg.range_a, 2.0) / max_adc
-        scale_b = RANGE_TO_VOLTS.get(self.cfg.range_b, 2.0) / max_adc
-        # Ensure indices are within our driver buffer
-        end = min(idx + n, self.cfg.driver_buffer_size)
-        cnt = max(0, end - idx)
-        if cnt <= 0:
-            return
-        with self._lock:
-            a = np.frombuffer(self._buf_a, dtype=np.int16, count=cnt, offset=idx * 2) * scale_a
-            b = np.frombuffer(self._buf_b, dtype=np.int16, count=cnt, offset=idx * 2) * scale_b
-            # Write into ring buffer; if cnt > ring length, keep the last portion
-            if cnt >= self._ring_len:
-                self._y_a[:] = a[-self._ring_len:]
-                self._y_b[:] = b[-self._ring_len:]
-                self._write_idx = 0
-            else:
-                write_end = min(self._write_idx + cnt, self._ring_len)
-                part1 = write_end - self._write_idx
-                self._y_a[self._write_idx:write_end] = a[:part1]
-                self._y_b[self._write_idx:write_end] = b[:part1]
-                remaining = cnt - part1
-                if remaining > 0:
-                    self._y_a[0:remaining] = a[part1:part1+remaining]
-                    self._y_b[0:remaining] = b[part1:part1+remaining]
-                    self._write_idx = remaining
-                else:
-                    self._write_idx = write_end % self._ring_len
-
-    def _ensure_sample_interval_supported(self) -> None:
-        """Check the minimum achievable timebase using stateless API.
-        If the requested sampling interval is lower (i.e., faster) than supported,
-        adjust `self.cfg.sample_interval_ns` upward and log diagnostics.
-        """
-        tb_out = c_uint32(0)
-        ti_out = c_double(0.0)
-        # Enable flags for A and B channels (bitmask): assume bit per channel id
-        enabled_flags = (1 << PS5000A_CHANNEL_A) | (1 << PS5000A_CHANNEL_B)
-        st = self.ps.ps5000aGetMinimumTimebaseStateless(
-            self.handle,
-            c_uint32(enabled_flags),
-            byref(tb_out),
-            byref(ti_out),
-            c_uint32(self.cfg.resolution)
-        )
-        if int(st) != PICO_OK:
-            _check_status(st, "ps5000aGetMinimumTimebaseStateless")
-        # Resolve units via GetTimebase2 using returned minimum timebase to get nanoseconds
-        tmp_dt = c_float(0.0)
-        st2 = self.ps.ps5000aGetTimebase2(self.handle, tb_out, c_int32(self._ring_len), byref(tmp_dt), c_int16(0), c_uint32(0))
-        _check_status(st2, "ps5000aGetTimebase2(min)")
-        min_ns = float(tmp_dt.value)
-        req_ns = float(self.cfg.sample_interval_ns)
-        if req_ns < min_ns:
-            print(f"Step 3a: Requested {req_ns:.2f} ns too fast; adjusting to {min_ns:.2f} ns (tb {int(tb_out.value)})")
-            self.cfg.sample_interval_ns = int(round(min_ns))
-            # Update internal dt and time axis to reflect new rate
-            self._dt_s = self.cfg.sample_interval_ns * 1e-9
-            window_s = self.cfg.plot_window_ms * 1e-3
-            with self._lock:
-                self._t = np.linspace(0.0, window_s - self._dt_s, self._ring_len, dtype=np.float64)
-
-    def _find_timebase(self, target_ns: int, samples: int) -> int:
-        best_tb = 1
-        best_err = float('inf')
-        tmp_dt = c_float(0.0)
-        for tb in range(1, 100):
-            st = self.ps.ps5000aGetTimebase2(self.handle, c_uint32(tb), c_int32(samples), byref(tmp_dt), c_int16(0), c_uint32(0))
-            if int(st) != PICO_OK:
-                continue
-            dt_ns = float(tmp_dt.value)
-            err = abs(dt_ns - target_ns)
-            if err < best_err:
-                best_err = err
-                best_tb = tb
-                self._dt_s = dt_ns * 1e-9
-                window_s = self.cfg.plot_window_ms * 1e-3
-                with self._lock:
-                    self._t = np.linspace(0.0, window_s - self._dt_s, self._ring_len, dtype=np.float64)
-                print(f"Step 3: Timebase {tb} -> {dt_ns:.2f} ns/sample")
-            if best_err < 1e-6:
-                break
-        return best_tb
-
-    def reconfigure_timebase(self, new_sample_interval_ns: int) -> int:
-        """Update the requested sample interval, rebuild ring buffers/time axis.
-        Caller should stop streaming before calling and restart after.
-        Returns the actual sample interval (ns) after constraints.
-        """
-        # Update request
-        self.cfg.sample_interval_ns = int(max(1, new_sample_interval_ns))
-        # Ensure within device limits and update dt
-        try:
-            self._ensure_sample_interval_supported()
-        except Exception:
-            pass
-        self._dt_s = self.cfg.sample_interval_ns * 1e-9
-        window_s = self.cfg.plot_window_ms * 1e-3
-        # Recompute ring length to preserve time window duration
-        new_ring_len = int(max(10, round(window_s / self._dt_s)))
-        with self._lock:
-            self._ring_len = new_ring_len
-            self._y_a = np.zeros(self._ring_len, dtype=np.float32)
-            self._y_b = np.zeros(self._ring_len, dtype=np.float32)
-            self._write_idx = 0
-            self._t = np.linspace(0.0, window_s - self._dt_s, self._ring_len, dtype=np.float64)
-        return int(self.cfg.sample_interval_ns)
-
-    def reconfigure_window_ms(self, new_window_ms: float) -> float:
-        """Resize rolling window duration (ms) and rebuild ring buffers/time axis.
-        Does not change device sampling interval; safe while streaming.
-        Returns the actual window (ms).
-        """
-        # Allow sub-millisecond windows (down to 0.01 ms = 10 µs)
-        new_window_ms = float(max(0.01, new_window_ms))
-        self.cfg.plot_window_ms = float(new_window_ms)
-        window_s = self.cfg.plot_window_ms * 1e-3
-        dt_s = self._dt_s
-        new_ring_len = int(max(10, round(window_s / dt_s)))
-        with self._lock:
-            self._ring_len = new_ring_len
-            self._y_a = np.zeros(self._ring_len, dtype=np.float32)
-            self._y_b = np.zeros(self._ring_len, dtype=np.float32)
-            self._write_idx = 0
-            self._t = np.linspace(0.0, window_s - dt_s, self._ring_len, dtype=np.float64)
-        return float(self.cfg.plot_window_ms)
+from plotter import PlotterWidget
+from picoscope_constants import (
+    RANGE_CODES,
+    RANGE_LABELS,
+    RANGE_TO_VOLTS,
+    PS5000A_CHANNEL_A,
+    PS5000A_CHANNEL_B,
+)
+from picoscope_driver import (
+    StreamConfig as DriverStreamConfig,
+    PicoScopeStreamer as DriverPicoScopeStreamer,
+)
+
+
+## Constants moved to picoscope_constants.py
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -756,7 +39,7 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("PicoScope 5000B Streaming Viewer")
 
-        self.cfg = StreamConfig()
+        self.cfg = DriverStreamConfig()
         # Build UI: controls row + plot
         central = QtWidgets.QWidget()
         vbox = QtWidgets.QVBoxLayout(central)
@@ -855,24 +138,54 @@ class MainWindow(QtWidgets.QMainWindow):
         hbox.addWidget(self.window_spin)
 
         vbox.addWidget(ctrl)
-        
-        # Matplotlib plot (only backend)
-        self.mpl_canvas = FigureCanvas(Figure(figsize=(6, 3), dpi=100))
-        self.mpl_ax = self.mpl_canvas.figure.add_subplot(111)
-        self.mpl_ax.grid(True)
-        self.mpl_ax.set_ylim(-0.5, 0.5)
-        # Time axis label/formatter set based on current window
-        (self.mpl_line_a,) = self.mpl_ax.plot([], [], color='c', linewidth=1, label='Channel A')
-        (self.mpl_line_b,) = self.mpl_ax.plot([], [], color='m', linewidth=1, label='Channel B')
-        self.mpl_ax.legend(loc='upper right')
-        vbox.addWidget(self.mpl_canvas, 1)
+
+        # Plot widget + right-side panel for cursor readouts
+        self.plotter = PlotterWidget(self)
+        content = QtWidgets.QWidget()
+        content_h = QtWidgets.QHBoxLayout(content)
+        content_h.setContentsMargins(0, 0, 0, 0)
+        content_h.addWidget(self.plotter, 1)
+
+        self.sidebar = QtWidgets.QWidget()
+        side_v = QtWidgets.QVBoxLayout(self.sidebar)
+        side_v.setContentsMargins(10, 5, 10, 5)
+        self.sidebar.setFixedWidth(200)
+        title = QtWidgets.QLabel("Cursors")
+        font = title.font()
+        font.setBold(True)
+        title.setFont(font)
+        side_v.addWidget(title)
+        side_v.addSpacing(4)
+
+        # X cursor readouts
+        side_v.addWidget(QtWidgets.QLabel("X (time):"))
+        self.lbl_v1 = QtWidgets.QLabel("X1: —")
+        self.lbl_v2 = QtWidgets.QLabel("X2: —")
+        self.lbl_dx = QtWidgets.QLabel("Δx: —")
+        side_v.addWidget(self.lbl_v1)
+        side_v.addWidget(self.lbl_v2)
+        side_v.addWidget(self.lbl_dx)
+
+        side_v.addSpacing(8)
+        # Y cursor readouts
+        side_v.addWidget(QtWidgets.QLabel("Y (amplitude):"))
+        self.lbl_h1 = QtWidgets.QLabel("Y1: —")
+        self.lbl_h2 = QtWidgets.QLabel("Y2: —")
+        self.lbl_dy = QtWidgets.QLabel("Δy: —")
+        side_v.addWidget(self.lbl_h1)
+        side_v.addWidget(self.lbl_h2)
+        side_v.addWidget(self.lbl_dy)
+        side_v.addStretch(1)
+
+        content_h.addWidget(self.sidebar, 0)
+        vbox.addWidget(content, 1)
         self.setCentralWidget(central)
 
         window_s = self.cfg.plot_window_ms * 1e-3
         self.dt = self.cfg.sample_interval_ns * 1e-9
         self.t = np.linspace(0.0, window_s - self.dt, int(round(window_s / self.dt)), dtype=np.float64)
 
-        self.streamer: PicoScopeStreamer | None = None
+        self.streamer: DriverPicoScopeStreamer | None = None
         self._synthetic_phase = 0.0
         # Base rate tracking
         self._rate_base_ns: int = int(self.cfg.sample_interval_ns)
@@ -883,8 +196,31 @@ class MainWindow(QtWidgets.QMainWindow):
             1e-3, 2e-3, 5e-3, 10e-3,
         ]
 
+        # Cursor controls (2 vertical + 2 horizontal) and UI
+        hbox.addSpacing(20)
+        hbox.addWidget(QtWidgets.QLabel("Cursor:"))
+        self.cursor_select = QtWidgets.QComboBox()
+        # Order matters: used by logic
+        self.cursor_select.addItem("X1", userData=("v", 0))
+        self.cursor_select.addItem("X2", userData=("v", 1))
+        self.cursor_select.addItem("Y1", userData=("h", 0))
+        self.cursor_select.addItem("Y2", userData=("h", 1))
+        hbox.addWidget(self.cursor_select)
+        self.cursor_dec_btn = QtWidgets.QPushButton("◀ / ▼")
+        self.cursor_inc_btn = QtWidgets.QPushButton("▶ / ▲")
+        self.cursor_dec_btn.setFixedWidth(70)
+        self.cursor_inc_btn.setFixedWidth(70)
+        self.cursor_dec_btn.setToolTip("Move left (X) / down (Y)")
+        self.cursor_inc_btn.setToolTip("Move right (X) / up (Y)")
+        self.cursor_dec_btn.clicked.connect(lambda: self._on_cursor_move(-1))
+        self.cursor_inc_btn.clicked.connect(lambda: self._on_cursor_move(1))
+        hbox.addWidget(self.cursor_dec_btn)
+        hbox.addWidget(self.cursor_inc_btn)
+
+        self._refresh_cursor_readouts()
+
         try:
-            self.streamer = PicoScopeStreamer(self.cfg)
+            self.streamer = DriverPicoScopeStreamer(self.cfg)
             self.streamer.open()
             self.streamer.start()
             actual_ns = self.streamer.cfg.sample_interval_ns
@@ -917,25 +253,11 @@ class MainWindow(QtWidgets.QMainWindow):
             ya_n = ya / fs_a if fs_a else ya
             yb_n = yb / fs_b if fs_b else yb
 
-            # Matplotlib with decimation for performance
-            tt_d, ya_d = self._decimate(tt, ya_n, self.cfg.plot_max_points)
-            _, yb_d = self._decimate(tt, yb_n, self.cfg.plot_max_points)
-            self.mpl_line_a.set_data(tt_d, ya_d)
-            self.mpl_line_b.set_data(tt_d, yb_d)
-            if len(tt_d) > 1:
-                # Show the full available window without extra zoom to avoid empty areas
-                self.mpl_ax.set_xlim(float(tt_d[0]), float(tt_d[-1]))
-            self.mpl_canvas.draw_idle()
+            # Delegate plotting and cursor rendering to PlotterWidget
+            self.plotter.update_series(tt, ya_n, yb_n, self.cfg.plot_max_points)
         else:
             # No hardware or not running: do not draw synthetic data
             return
-
-    def _decimate(self, x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
-        n = len(x)
-        if n <= max_points:
-            return x, y
-        idx = np.linspace(0, n - 1, max_points, dtype=np.int32)
-        return x[idx], y[idx]
 
     def _on_a_range_changed(self, idx: int) -> None:
         code = self.a_range_combo.itemData(idx)
@@ -1071,22 +393,13 @@ class MainWindow(QtWidgets.QMainWindow):
         window_s = self.cfg.plot_window_ms * 1e-3
         self.t = np.linspace(0.0, window_s - self.dt, int(round(window_s / self.dt)), dtype=np.float64)
 
-        # Update Matplotlib x-limits to match time window if active
-        if hasattr(self, 'mpl_ax'):
-            self.mpl_ax.set_ylim(-0.5, 0.5)
-            self._apply_time_axis_format(window_s)
-            # x-limits will be updated on next draw with data
+        # Let plotter handle axis formatting
+        self._apply_time_axis_format(window_s)
 
     def _apply_time_axis_format(self, window_s: float) -> None:
-        # Choose units based on window size
-        if window_s < 1e-3:
-            # microseconds
-            self.mpl_ax.set_xlabel("Time (µs)")
-            self.mpl_ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{x * 1e6:.1f}"))
-        else:
-            # milliseconds
-            self.mpl_ax.set_xlabel("Time (ms)")
-            self.mpl_ax.xaxis.set_major_formatter(mticker.FuncFormatter(lambda x, pos: f"{x * 1e3:.1f}"))
+        # Delegate to plotter; it will also keep cursor artists in sync
+        self.plotter.apply_time_axis_format(window_s)
+        self._refresh_cursor_readouts()
 
     def _set_window_ms(self, window_ms: float) -> None:
         if self.streamer:
@@ -1141,6 +454,36 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception as e:
                 self.status_lbl.setText(f"Status: Window change failed — {e}")
         self.update_plot()
+
+
+    def _on_cursor_move(self, direction: int) -> None:
+        # direction: -1 for left/down, +1 for right/up
+        data = self.cursor_select.currentData()
+        if not data or not isinstance(data, tuple):
+            return
+        kind, idx = data  # kind: 'v' or 'h', idx: 0 or 1
+        self.plotter.move_cursor(kind, idx, direction)
+        self._refresh_cursor_readouts()
+
+    def _format_time(self, seconds: float) -> str:
+        # Follow axis convention: <1 ms -> µs, else ms
+        if (self.cfg.plot_window_ms * 1e-3) < 1e-3:
+            return f"{seconds * 1e6:.3f} µs"
+        return f"{seconds * 1e3:.3f} ms"
+
+    def _refresh_cursor_readouts(self) -> None:
+        try:
+            x1, x2, y1, y2, dx, dy = self.plotter.get_cursor_values()
+        except Exception:
+            return
+        # Time readouts formatted to axis units
+        self.lbl_v1.setText(f"X1: {self._format_time(x1)}")
+        self.lbl_v2.setText(f"X2: {self._format_time(x2)}")
+        self.lbl_dx.setText(f"Δx: {self._format_time(dx)}")
+        # Amplitude readouts use normalized units (plot is normalized)
+        self.lbl_h1.setText(f"Y1: {y1:+.3f}")
+        self.lbl_h2.setText(f"Y2: {y2:+.3f}")
+        self.lbl_dy.setText(f"Δy: {dy:.3f}")
 
 
     def closeEvent(self, a0) -> None:
