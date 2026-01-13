@@ -34,6 +34,14 @@ class PlotterWidget(QtWidgets.QWidget):
         }
         self._cursor_lines_v: list[Line2D] = []
         self._cursor_lines_h: list[Line2D] = []
+        # Trigger indicator (horizontal line at normalized y) — must exist before first artist update
+        self._trigger_value: float = 0.0
+        xmin, xmax = self._current_xlim()
+        ymin, ymax = self._current_ylim()
+        self._trigger_line = Line2D([xmin, xmax], [self._trigger_value, self._trigger_value],
+                                     color="#000000", linestyle="-.", linewidth=1.2, alpha=0.9)
+        self.ax.add_line(self._trigger_line)
+        # Now init cursors, which will call _update_cursor_artists()
         self._init_cursors()
 
     # ----- Public API -----
@@ -82,6 +90,23 @@ class PlotterWidget(QtWidgets.QWidget):
         dx = abs(x2 - x1)
         dy = abs(y2 - y1)
         return x1, x2, y1, y2, dx, dy
+
+    # Trigger helpers
+    def set_trigger_level_norm(self, y: float) -> None:
+        ymin, ymax = self._current_ylim()
+        y = float(min(max(y, ymin), ymax))
+        self._trigger_value = y
+        xmin, xmax = self._current_xlim()
+        self._trigger_line.set_data([xmin, xmax], [y, y])
+        self.canvas.draw_idle()
+
+    def move_trigger(self, direction: int) -> None:
+        ymin, ymax = self._current_ylim()
+        step = self._cursor_step_frac_y * (ymax - ymin)
+        self.set_trigger_level_norm(self._trigger_value + float(direction) * step)
+
+    def get_trigger_level_norm(self) -> float:
+        return float(self._trigger_value)
 
     # ----- Internals -----
     def _decimate(self, x: np.ndarray, y: np.ndarray, max_points: int):
@@ -135,3 +160,6 @@ class PlotterWidget(QtWidgets.QWidget):
             y = float(self._cursor_positions['h'][i])
             y = min(max(y, ymin), ymax)
             line.set_data([xmin, xmax], [y, y])
+        # Update trigger indicator
+        y = float(min(max(self._trigger_value, ymin), ymax))
+        self._trigger_line.set_data([xmin, xmax], [y, y])

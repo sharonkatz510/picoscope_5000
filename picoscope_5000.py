@@ -91,24 +91,16 @@ class MainWindow(QtWidgets.QMainWindow):
         hbox.addWidget(self.rate_combo)
         hbox.addWidget(self.apply_rate_btn)
 
-        # Trigger controls
+        # Trigger controls (checkbox only; level shown in sidebar)
         hbox.addSpacing(20)
         self.trigger_chk = QtWidgets.QCheckBox("Trigger")
         self.trigger_chk.setChecked(self.cfg.simple_trigger_enabled)
         hbox.addWidget(self.trigger_chk)
-        self.trigger_lbl = QtWidgets.QLabel("Level (V):")
-        hbox.addWidget(self.trigger_lbl)
-        self.trigger_edit = QtWidgets.QLineEdit()
-        self.trigger_edit.setFixedWidth(80)
-        self.trigger_edit.setPlaceholderText("e.g. 0.100")
-        # Initialize from current config (assume trigger source A by default)
+        # Initialize internal trigger level (volts) from config and current trigger source range
         init_rng = self.cfg.range_a if self.cfg.trigger_source == PS5000A_CHANNEL_A else self.cfg.range_b
-        init_v = self.cfg.trigger_threshold_pct * RANGE_TO_VOLTS.get(init_rng, 2.0)
-        self.trigger_edit.setText(f"{init_v:.3f}")
-        hbox.addWidget(self.trigger_edit)
-        # Wire events
+        self._trigger_level_v = float(self.cfg.trigger_threshold_pct * RANGE_TO_VOLTS.get(init_rng, 2.0))
+        # Wire event
         self.trigger_chk.toggled.connect(self._apply_trigger_ui)
-        self.trigger_edit.editingFinished.connect(self._apply_trigger_ui)
 
         # Timebase +/- buttons (discrete window sizes)
         hbox.addSpacing(20)
@@ -175,6 +167,11 @@ class MainWindow(QtWidgets.QMainWindow):
         side_v.addWidget(self.lbl_h1)
         side_v.addWidget(self.lbl_h2)
         side_v.addWidget(self.lbl_dy)
+        side_v.addSpacing(8)
+        # Trigger readout
+        side_v.addWidget(QtWidgets.QLabel("Trigger (V):"))
+        self.lbl_trig = QtWidgets.QLabel("—")
+        side_v.addWidget(self.lbl_trig)
         side_v.addStretch(1)
 
         content_h.addWidget(self.sidebar, 0)
@@ -205,6 +202,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cursor_select.addItem("X2", userData=("v", 1))
         self.cursor_select.addItem("Y1", userData=("h", 0))
         self.cursor_select.addItem("Y2", userData=("h", 1))
+        self.cursor_select.addItem("Trigger", userData=("t", 0))
         hbox.addWidget(self.cursor_select)
         self.cursor_dec_btn = QtWidgets.QPushButton("◀ / ▼")
         self.cursor_inc_btn = QtWidgets.QPushButton("▶ / ▲")
@@ -229,6 +227,11 @@ class MainWindow(QtWidgets.QMainWindow):
             # Ensure axis formatter matches current window size
             self._apply_time_axis_format(self.cfg.plot_window_ms * 1e-3)
             self.status_lbl.setText(f"Status: Hardware @ {actual_ns} ns; Res {self.streamer.cfg.resolution}")
+            # Apply initial trigger indicator line based on current level and range
+            rng = self.streamer.cfg.range_a if self.streamer.cfg.trigger_source == PS5000A_CHANNEL_A else self.streamer.cfg.range_b
+            fs_v = RANGE_TO_VOLTS.get(rng, 1.0)
+            norm_y = (self._trigger_level_v / fs_v) if fs_v else 0.0
+            self.plotter.set_trigger_level_norm(norm_y)
         except Exception as e:
             print(f"Error during initialization: {e}")
             self.streamer = None
@@ -287,7 +290,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 was_running = self.streamer._running
                 if was_running:
                     self.streamer.stop()
-                self.streamer.set_range(channel, new_range)
+                    self.streamer.set_range(channel, new_range)  # Set the new range for the channel
                 if was_running:
                     self.streamer.start()
             except Exception as e:
@@ -366,17 +369,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _apply_trigger_ui(self) -> None:
         enabled = self.trigger_chk.isChecked()
-        # Parse volts from textbox
-        text = self.trigger_edit.text().strip()
-        try:
-            level_v = float(text) if text else 0.0
-        except ValueError:
-            self.status_lbl.setText("Status: Invalid trigger level; enter a number in volts")
-            return
+        level_v = float(self._trigger_level_v)
         # Apply to hardware if running; else update config only
         if self.streamer:
             try:
-                # Restart streaming to ensure settings take effect cleanly
                 was_running = self.streamer._running
                 if was_running:
                     self.streamer.stop()
@@ -385,7 +381,11 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.streamer.start()
                 state = "ON" if enabled else "OFF"
                 self.status_lbl.setText(f"Status: Trigger {state} @ {level_v:.3f} V (rising)")
-                print(f"[UI] Trigger {state} @ {level_v:.6f} V (rising)")
+                # Update trigger indicator line in normalized units
+                rng = self.streamer.cfg.range_a if self.streamer.cfg.trigger_source == PS5000A_CHANNEL_A else self.streamer.cfg.range_b
+                fs_v = RANGE_TO_VOLTS.get(rng, 1.0)
+                norm_y = (level_v / fs_v) if fs_v else 0.0
+                self.plotter.set_trigger_level_norm(norm_y)
             except Exception as e:
                 self.status_lbl.setText(f"Status: Trigger apply failed — {e}")
         else:
@@ -394,8 +394,10 @@ class MainWindow(QtWidgets.QMainWindow):
             rng = self.cfg.range_a if self.cfg.trigger_source == PS5000A_CHANNEL_A else self.cfg.range_b
             full_scale_v = RANGE_TO_VOLTS.get(rng, 2.0)
             self.cfg.trigger_threshold_pct = float(level_v) / float(full_scale_v) if full_scale_v else 0.0
-            state = "ON" if enabled else "OFF"
-            print(f"[UI] Trigger {state} (no hardware) @ {level_v:.6f} V (rising)")
+            # Update trigger line based on config
+            norm_y = (level_v / full_scale_v) if full_scale_v else 0.0
+            self.plotter.set_trigger_level_norm(norm_y)
+        self._refresh_trigger_readout()
 
     def _update_time_axis(self, sample_ns: int) -> None:
         self.dt = sample_ns * 1e-9
@@ -471,8 +473,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if not data or not isinstance(data, tuple):
             return
         kind, idx = data  # kind: 'v' or 'h', idx: 0 or 1
-        self.plotter.move_cursor(kind, idx, direction)
-        self._refresh_cursor_readouts()
+        if kind in ('v', 'h'):
+            self.plotter.move_cursor(kind, idx, direction)
+            self._refresh_cursor_readouts()
+        elif kind == 't':
+            self._nudge_trigger(direction)
 
     def _format_time(self, seconds: float) -> str:
         # Follow axis convention: <1 ms -> µs, else ms
@@ -509,8 +514,50 @@ class MainWindow(QtWidgets.QMainWindow):
         sel_kind, idx = data
         if sel_kind != kind:
             return
+        # For Up/Down movements, allow both 'h' (Y) and 't' (Trigger)
+        if kind == 'h' and sel_kind == 't':
+            self._nudge_trigger(direction)
+            return
         self.plotter.move_cursor(kind, idx, direction)
         self._refresh_cursor_readouts()
+
+    def _nudge_trigger(self, direction: int) -> None:
+        # Move trigger indicator and apply new level to hardware/config
+        try:
+            self.plotter.move_trigger(direction)
+            norm_y = self.plotter.get_trigger_level_norm()
+            # Convert to volts based on trigger source channel range
+            if self.streamer:
+                trig_ch = self.streamer.cfg.trigger_source
+                rng = self.streamer.cfg.range_a if trig_ch == PS5000A_CHANNEL_A else self.streamer.cfg.range_b
+            else:
+                trig_ch = self.cfg.trigger_source
+                rng = self.cfg.range_a if trig_ch == PS5000A_CHANNEL_A else self.cfg.range_b
+            fs_v = RANGE_TO_VOLTS.get(rng, 1.0)
+            level_v = float(norm_y) * float(fs_v)
+            self._trigger_level_v = float(level_v)
+            self._refresh_trigger_readout()
+            # Apply to hardware if enabled, else update config
+            enabled = self.trigger_chk.isChecked()
+            if self.streamer:
+                was_running = self.streamer._running
+                if was_running:
+                    self.streamer.stop()
+                self.streamer.apply_trigger(enabled, level_v)
+                if was_running:
+                    self.streamer.start()
+            else:
+                # Update config threshold pct
+                full_scale_v = fs_v
+                self.cfg.trigger_threshold_pct = (level_v / full_scale_v) if full_scale_v else 0.0
+        except Exception as e:
+            self.status_lbl.setText(f"Status: Trigger move failed — {e}")
+
+    def _refresh_trigger_readout(self) -> None:
+        try:
+            self.lbl_trig.setText(f"{self._trigger_level_v:+.3f} V")
+        except Exception:
+            pass
 
 
 def picoscope_5000() -> int:

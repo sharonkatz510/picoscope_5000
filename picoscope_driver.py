@@ -169,6 +169,8 @@ class PicoScopeStreamer:
         self._ready_evt = threading.Event()
 
         self._bind_functions()
+        # Trigger gating state for streaming: when enabled, suppress updates until first trigger
+        self._seen_trigger: bool = False
 
     def apply_trigger(self, enabled: bool, threshold_volts: float) -> None:
         self.cfg.simple_trigger_enabled = bool(enabled)
@@ -204,6 +206,8 @@ class PicoScopeStreamer:
                 c_int32(0),
             )
             _check_status(st, "ps5000aSetSimpleTrigger(disable)")
+        # Rearm trigger gating for streaming updates
+        self._seen_trigger = False
 
     def _bind_functions(self) -> None:
         from ctypes import c_char_p
@@ -384,6 +388,12 @@ class PicoScopeStreamer:
         n = int(noOfSamples)
         if n <= 0:
             return
+        # If simple trigger is enabled, freeze updates until the first trigger occurs
+        if self.cfg.simple_trigger_enabled and not self._seen_trigger:
+            if int(triggered) == 0:
+                return
+            # First trigger observed; allow updates from now on
+            self._seen_trigger = True
         idx = int(startIndex)
         max_adc = float(self.max_adc.value if self.max_adc.value != 0 else 32767)
         scale_a = RANGE_TO_VOLTS.get(self.cfg.range_a, 2.0) / max_adc
