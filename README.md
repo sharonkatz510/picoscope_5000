@@ -1,14 +1,14 @@
 
-# PicoScope 5000B Streaming Viewer (Python, Windows 11)
+# PicoScope 5000B Rapid Block Viewer (Python, Windows 11)
 
-This app connects to PicoScope 5000 series hardware using the `ps5000a` driver (PicoSDK), streams Channels A and B, and plots live data in a PyQt5 GUI with an embedded Matplotlib plot. It uses the `ps5000aRunStreaming` + `ps5000aGetStreamingLatestValues` callback pattern.
+This app connects to PicoScope 5000 series hardware using the `ps5000a` driver (PicoSDK), acquires rapid block captures for Channels A and B, and renders them in a PyQt5 GUI with an embedded Matplotlib plot. It provides trigger level control, timebase window steps, cursors, and a file recording feature.
 
 ## Overview
 
-- Opens the scope, configures Channels A and B, and starts streaming automatically on launch.
-- Requests a sampling interval in nanoseconds (ns). Default UI selection is 1 µs (1,000 ns). The code automatically adjusts to the device’s minimum supported timebase when needed.
-- Keeps a rolling window buffer (default 20 ms) and refreshes the plot every 20 ms.
-- Normalizes the plotted amplitude by the selected full-scale range for each channel (y-axis spans ±0.5 by default).
+- Opens the scope, configures Channels A and B, and starts rapid block acquisition automatically on launch.
+- Requests a sampling interval in nanoseconds (ns). Default is 100 ns (10 MHz). The code automatically adjusts to the device’s minimum supported timebase when needed.
+- Uses a fixed capture length derived from the window and sampling interval; refreshes the plot every 20 ms.
+- Normalizes the plotted amplitude by the selected full-scale range for each channel (y-axis spans ±0.5 by default) and shows a trigger indicator line.
 
 ## Modules
 
@@ -65,14 +65,16 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-On startup the app attempts to open the first available scope, configures it, and starts streaming.
+On startup the app attempts to open the first available scope, configures it, and starts rapid block acquisition.
 
 ## UI Controls
 
 - Channel ranges: Two combo boxes set `A` and `B` voltage ranges from 10 mV to 20 V.
-- Sampling rate: A combo box (50 ns … 10 µs) plus “Apply Rate” button. The actual interval may adjust to the device minimum; the status bar shows the active ns value.
-- Trigger: Checkbox enables/disables a simple rising-edge trigger. Enter level in volts; it converts to device counts based on the selected range.
-- Timebase window: Buttons `−` and `+` step the rolling window through predefined durations (10 µs … 10 ms). A spin box allows precise window control (0.010 ms … 10.000 ms).
+- Sampling rate: A combo box (100 ns … 5 µs) plus “Apply Rate” button. The actual interval may adjust to the device minimum; the status bar shows the active ns value.
+- Trigger: Always enabled; controlled by the trigger level (in volts). A dashed line indicates the current level on the plot.
+- Timebase window: Buttons `−` and `+` step the window through predefined durations (10 µs … 10 ms). A spin box allows precise control (0.010 ms … 50.000 ms).
+- Cursors: Two vertical (time) and two horizontal (amplitude) cursors with delta readouts; keyboard arrows nudge the selected cursor.
+- Recording: Buttons for “Choose Location”, “Start Rec”, and “Stop Rec”. While recording, the UI shows an overlay and pauses plot refresh; acquisitions are saved to disk.
 
 ## Configuration (Driver `BlockConfig`)
 
@@ -92,9 +94,23 @@ Edit `BlockConfig` in [driver.py](driver.py) for defaults:
 ## Internal Behavior
 
 - Uses `ps5000aSetDataBuffer` (raw ADC counts) and converts to volts on the fly using the selected range.
-- Maintains ring buffers per channel sized to the current window, and decimates to `plot_max_points` for efficient plotting.
-- Automatically checks minimum achievable timebase via `ps5000aGetMinimumTimebaseStateless` and adjusts if a requested interval is too fast.
+- Acquires block captures sized to the current window and sampling interval; decimates for efficient plotting when needed.
+- Checks achievable timebase via `ps5000aGetTimebase2` and adjusts if a requested interval is too fast.
 - Attempts to preload `picoipp.dll` from the DLL directory; also adds common PicoSDK folders via `os.add_dll_directory` when available.
+
+## Recording
+
+- Choose a destination folder, press “Start Rec” to begin saving acquisitions; press “Stop Rec” to finish.
+- While recording, the plot pauses and shows a dark overlay “Recording in progress”.
+- Files are named `acq_001.bin`, `acq_002.bin`, … in the chosen folder.
+- Format: Channel A samples followed by Channel B samples; both as `float16` volts (older builds used `float32`).
+- Metadata file `metadata.txt` is written on stop with: `started_at` (ISO), `sampling_frequency_hz`, `frame_rate_hz`, and `acquisitions_saved`.
+- Load saved files in Python:
+	```python
+	from bin_reader import read_acq_bin
+	a, b = read_acq_bin(r"C:\path\to\acq_001.bin")          # float16 by default
+	a32, b32 = read_acq_bin(r"C:\path\to\old.bin", dtype="float32")
+	```
 
 ## Troubleshooting
 
