@@ -57,7 +57,7 @@ class BlockConfig:
     sample_interval_ns: int = 100  # 10 MHz
     plot_refresh_ms: int = 20
     plot_window_ms: float = 10.0
-    plot_max_points: int = 6000
+    plot_max_points: int = 5000 # this is the maximum value applicable in the official PicoScope software for 2 channels at 500MS/s rate
 
     range_a: int = 0  # set by UI
     range_b: int = 0
@@ -92,8 +92,8 @@ class PicoScopeRapidBlock:
         self._thread: threading.Thread | None = None
 
         self._dt_s = self.cfg.sample_interval_ns * 1e-9
-        self._window_s = self.cfg.plot_window_ms * 1e-3
-        self._n_samples = int(max(10, round(self._window_s / self._dt_s)))
+        self._n_samples = self.cfg.plot_max_points
+        self._window_s = self._n_samples * self._dt_s
         self._buf_a = (c_int16 * self._n_samples)()
         self._buf_b = (c_int16 * self._n_samples)()
 
@@ -115,7 +115,7 @@ class PicoScopeRapidBlock:
         self.ps.ps5000aSetChannel.restype = c_int32
         self.ps.ps5000aSetDataBuffer.argtypes = [c_int16, c_int32, POINTER(c_int16), c_int32, c_uint32, c_int32]
         self.ps.ps5000aSetDataBuffer.restype = c_int32
-        self.ps.ps5000aRunBlock.argtypes = [c_int16, c_int32, c_int32, c_uint32, c_int16, POINTER(c_int32), c_uint32, c_void_p, c_void_p]
+        self.ps.ps5000aRunBlock.argtypes = [c_int16, c_int32, c_int32, c_uint32, POINTER(c_int32), c_uint32, c_void_p, c_void_p]
         self.ps.ps5000aRunBlock.restype = c_int32
         self.ps.ps5000aIsReady.argtypes = [c_int16, POINTER(c_int16)]
         self.ps.ps5000aIsReady.restype = c_int32
@@ -244,7 +244,7 @@ class PicoScopeRapidBlock:
                     _check_status(st, "ps5000aSetDataBuffer(B)")
                     # Run block capture: pre=0, post=n
                     time_indisposed = c_int32(0)
-                    st = self.ps.ps5000aRunBlock(self.handle, c_int32(0), c_int32(self._n_samples), self._timebase, c_int16(0), byref(time_indisposed), c_uint32(0), None, None)
+                    st = self.ps.ps5000aRunBlock(self.handle, c_int32(0), c_int32(self._n_samples), self._timebase, byref(time_indisposed), c_uint32(0), None, None)
                     if int(st) != PICO_OK:
                         # Fatal: don't retry; break loop and close device
                         try:
