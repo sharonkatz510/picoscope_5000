@@ -196,7 +196,8 @@ class PicoScopeRapidBlock:
         fs_v = float(RANGE_TO_VOLTS.get(rng, 2.0))
         max_adc = float(self.max_adc.value if self.max_adc.value != 0 else 32767.0)
         counts = int(round(threshold_pct * max_adc))
-        auto_ms = int(max(1, self.cfg.plot_refresh_ms))
+        # Disable autotrigger: require an actual trigger event
+        auto_ms = 0
         if enabled:
             st = self.ps.ps5000aSetSimpleTrigger(
                 self.handle,
