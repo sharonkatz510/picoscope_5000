@@ -12,8 +12,8 @@ This app connects to PicoScope 5000 series hardware using the `ps5000a` driver (
 
 ## Modules
 
-- [picoscope_5000.py](picoscope_5000.py): Main UI/controller. Builds the PyQt5 interface, wires callbacks, formats the time axis, updates the plot, and manages cursor readouts via the plot widget. Delegates hardware actions to the streamer.
-- [picoscope_driver.py](picoscope_driver.py): Hardware streaming driver wrapper over PicoSDK (`ps5000a.dll`). Opens/closes the device, configures channels/ranges, applies trigger, and streams data into ring buffers. Exposes `StreamConfig` and `PicoScopeStreamer`.
+- [main.py](main.py): Main UI/controller. Builds the PyQt5 interface, wires callbacks, formats the time axis, updates the plot, manages cursor readouts via the plot widget, and includes recording controls.
+- [driver.py](driver.py): Hardware rapid block driver wrapper over PicoSDK (`ps5000a.dll`). Opens/closes the device, configures channels/ranges, applies trigger, and acquires block captures for plotting and recording. Exposes `BlockConfig` and `PicoScopeRapidBlock`.
 - [plotter.py](plotter.py): Plotting and cursor management. Embeds Matplotlib in a Qt widget, renders channels A/B, and provides two X cursors and two Y cursors with movement and readouts.
 - [picoscope_constants.py](picoscope_constants.py): Centralized PicoSDK enums, range maps/labels, and status codes. Also loads optional status text overrides from JSON.
 - [pico_status_dict.json](pico_status_dict.json): Optional map of Pico status codes to human-readable strings; merged into the defaults on startup.
@@ -62,7 +62,7 @@ python -m pip install -r requirements.txt
 ## Run
 
 ```powershell
-python picoscope_5000.py
+python main.py
 ```
 
 On startup the app attempts to open the first available scope, configures it, and starts streaming.
@@ -74,19 +74,19 @@ On startup the app attempts to open the first available scope, configures it, an
 - Trigger: Checkbox enables/disables a simple rising-edge trigger. Enter level in volts; it converts to device counts based on the selected range.
 - Timebase window: Buttons `−` and `+` step the rolling window through predefined durations (10 µs … 10 ms). A spin box allows precise window control (0.010 ms … 10.000 ms).
 
-## Configuration (Driver `StreamConfig`)
+## Configuration (Driver `BlockConfig`)
 
-Edit `StreamConfig` in [picoscope_driver.py](picoscope_driver.py) for defaults:
-- `sample_interval_ns`: requested sample interval in ns (default 1000 ns = 1 µs)
+Edit `BlockConfig` in [driver.py](driver.py) for defaults:
+- `sample_interval_ns`: requested sample interval in ns (default 100 ns)
 - `plot_refresh_ms`: GUI refresh period (default 20 ms)
-- `plot_window_ms`: rolling window duration (default 20.0 ms)
-- `plot_max_points`: decimation target for plotting (default 6000)
-- `range_a`, `range_b`: channel ranges (default 2 V)
-- `coupling`: `AC` or `DC` (default DC)
+- `plot_window_ms`: window duration for block acquisitions (default 10.0 ms)
+- `plot_max_points`: max points for plotting/decimation (default 5000)
+- `range_a`, `range_b`: channel ranges (set by UI on startup)
+- `coupling`: `AC` or `DC` (default AC)
 - `resolution`: device resolution enum (default 8-bit)
-- `driver_buffer_size`: driver overview buffer size (default 200,000 samples)
-- `connect_delay_ms`: delay after open before acquisitions (default 1000 ms)
-- `simple_trigger_enabled`: off by default; see Trigger controls
+- `driver_buffer_size`: driver buffer size for block captures
+- `connect_delay_ms`: delay after open before first acquisition
+- `simple_trigger_enabled`: trigger control (enabled by default)
 - `trigger_source`, `trigger_threshold_pct`, `trigger_direction`: trigger configuration
 
 ## Internal Behavior

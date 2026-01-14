@@ -25,7 +25,29 @@ from picoscope_constants import (
     PICO_POWER_SUPPLY_NOT_CONNECTED,
     _status_text,
 )
-from picoscope_driver import PicoSDKError, _check_status  # reuse helpers
+# Local SDK error helpers (decoupled from streaming driver)
+class PicoSDKError(RuntimeError):
+    pass
+
+# Verbose logging controlled by env var PICO_VERBOSE (any non-empty value enables)
+_PICO_VERBOSE = bool(os.environ.get("PICO_VERBOSE", "").strip())
+
+def _check_status(status: int, where: str) -> None:
+    code = int(status)
+    if _PICO_VERBOSE:
+        try:
+            msg = _status_text(status)
+        except Exception:
+            msg = str(status)
+        print(f"[PicoSDK] {where}: status={code} {msg}")
+    if code != PICO_OK:
+        # Always emit an error line before raising
+        try:
+            err = _status_text(status)
+        except Exception:
+            err = str(status)
+        print(f"[PicoSDK][ERROR] {where} failed: {err}")
+        raise PicoSDKError(f"{where} failed: {err}")
 
 
 def _find_ps5000a_dll() -> str:
