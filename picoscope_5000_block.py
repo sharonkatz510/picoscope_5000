@@ -9,6 +9,8 @@ import sys
 import numpy as np
 
 from PyQt5 import QtCore, QtWidgets, QtGui
+import os
+import datetime
 from plotter import PlotterWidget
 from picoscope_constants import (
     RANGE_CODES,
@@ -143,6 +145,22 @@ class MainWindow(QtWidgets.QMainWindow):
         hbox.addWidget(self.cursor_dec_btn)
         hbox.addWidget(self.cursor_inc_btn)
 
+        # Recording controls
+        hbox.addSpacing(20)
+        self.rec_folder_btn = QtWidgets.QPushButton("Choose Location")
+        self.rec_start_btn = QtWidgets.QPushButton("Start Rec")
+        self.rec_stop_btn = QtWidgets.QPushButton("Stop Rec")
+        self.rec_status_lbl = QtWidgets.QLabel("Save: none")
+        self.rec_status_lbl.setToolTip("Selected folder for recordings")
+        self.rec_folder_btn.clicked.connect(self._on_choose_rec_folder)
+        self.rec_start_btn.clicked.connect(self._on_start_rec)
+        self.rec_stop_btn.clicked.connect(self._on_stop_rec)
+        self.rec_stop_btn.setEnabled(False)
+        hbox.addWidget(self.rec_folder_btn)
+        hbox.addWidget(self.rec_start_btn)
+        hbox.addWidget(self.rec_stop_btn)
+        hbox.addWidget(self.rec_status_lbl)
+
         vbox.addWidget(ctrl)
 
         # Plot widget + right-side panel for cursor readouts
@@ -191,6 +209,14 @@ class MainWindow(QtWidgets.QMainWindow):
         content_h.addWidget(self.sidebar, 0)
         vbox.addWidget(content, 1)
         self.setCentralWidget(central)
+
+        # Overlay message shown during recording
+        self.rec_overlay_lbl = QtWidgets.QLabel("Recording in progress", self.plotter.canvas)
+        self.rec_overlay_lbl.setAlignment(QtCore.Qt.AlignCenter)
+        self.rec_overlay_lbl.setStyleSheet(
+            "background-color: rgba(0, 0, 0, 120); color: white; padding: 6px;"
+        )
+        self.rec_overlay_lbl.setVisible(False)
 
         self.block: DriverPicoScopeRapidBlock | None = None
 
@@ -242,6 +268,12 @@ class MainWindow(QtWidgets.QMainWindow):
             1e-3, 2e-3, 5e-3, 10e-3,
         ]
         self._refresh_cursor_readouts()
+        # Recording state
+        self._rec_dir: str | None = None
+        self._rec_on: bool = False
+        self._rec_count: int = 0
+        self._rec_started_at: datetime.datetime | None = None
+        self._rec_meta: dict[str, object] = {}
 
     def update_plot(self) -> None:
         if self.block and self.block._running:
@@ -249,12 +281,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 ya = self.block._y_a.copy()
                 yb = self.block._y_b.copy()
                 tt = self.block._t.copy()
-            fs_a = RANGE_TO_VOLTS.get(self.block.cfg.range_a, 1.0)
-            fs_b = RANGE_TO_VOLTS.get(self.block.cfg.range_b, 1.0)
-            ya_n = ya / fs_a if fs_a else ya
-            yb_n = yb / fs_b if fs_b else yb
-            self.plotter.update_series(tt, ya_n, yb_n, self.cfg.plot_max_points)
-            self._refresh_cursor_readouts()
+            if not self._rec_on:
+                # Normal UI refresh when not recording
+                fs_a = RANGE_TO_VOLTS.get(self.block.cfg.range_a, 1.0)
+                fs_b = RANGE_TO_VOLTS.get(self.block.cfg.range_b, 1.0)
+                ya_n = ya / fs_a if fs_a else ya
+                yb_n = yb / fs_b if fs_b else yb
+                self.plotter.update_series(tt, ya_n, yb_n, self.cfg.plot_max_points)
+                self._refresh_cursor_readouts()
+                # Hide any overlay if previously shown
+                if self.rec_overlay_lbl.isVisible():
+                    self.rec_overlay_lbl.setVisible(False)
+            else:
+                # Recording mode: do not refresh plot, show overlay message
+                self.rec_overlay_lbl.setGeometry(self.plotter.canvas.rect())
+                if not self.rec_overlay_lbl.isVisible():
+                    self.rec_overlay_lbl.setVisible(True)
+            # Save current acquisition to disk if recording is active
+            try:
+                if self._rec_on and self._rec_dir and len(ya) and len(yb):
+                    self._rec_count += 1
+                    fname = f"acq_{self._rec_count:03d}.bin"
+                    fpath = QtCore.QDir(self._rec_dir).filePath(fname)
+                    # Write A then B as float16 raw binary
+                    with open(fpath, "wb") as f:
+                        ya.astype(np.float16, copy=False).tofile(f)
+                        yb.astype(np.float16, copy=False).tofile(f)
+            except Exception as e:
+                # Non-fatal: update status and keep UI responsive
+                self.status_lbl.setText(f"Status: Save failed — {e}")
 
     def _on_a_range_changed(self, idx: int) -> None:
         code = self.a_range_combo.itemData(idx)
@@ -441,6 +496,66 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.block.close()
         finally:
             super().closeEvent(a0)
+
+    # ----- Recording controls -----
+    def _on_choose_rec_folder(self) -> None:
+        start_dir = self._rec_dir or QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.DesktopLocation)
+        folder = QtWidgets.QFileDialog.getExistingDirectory(self, "Choose recording folder", start_dir)
+        if folder:
+            self._rec_dir = folder
+            self.rec_status_lbl.setText(f"Save: {QtCore.QFileInfo(folder).fileName()}")
+            self.rec_status_lbl.setToolTip(folder)
+
+    def _on_start_rec(self) -> None:
+        if not self._rec_dir:
+            self._on_choose_rec_folder()
+            if not self._rec_dir:
+                return
+        self._rec_on = True
+        self._rec_count = 0
+        # Capture start time and session metadata
+        self._rec_started_at = datetime.datetime.now()
+        # Sampling frequency (Hz)
+        if self.block:
+            si_ns = float(self.block.cfg.sample_interval_ns)
+        else:
+            si_ns = float(self.cfg.sample_interval_ns)
+        samp_hz = 1e9 / si_ns if si_ns > 0 else 0.0
+        # Frame rate tied to UI update interval (Hz)
+        fr_ms = float(self.cfg.plot_refresh_ms)
+        frame_hz = 1000.0 / fr_ms if fr_ms > 0 else 0.0
+        self._rec_meta = {
+            "sampling_frequency_hz": samp_hz,
+            "frame_rate_hz": frame_hz,
+            "started_at": self._rec_started_at.isoformat(timespec="seconds"),
+        }
+        self.rec_start_btn.setEnabled(False)
+        self.rec_stop_btn.setEnabled(True)
+        self.rec_folder_btn.setEnabled(False)
+        self.status_lbl.setText(f"Status: Recording → {self._rec_dir}")
+
+    def _on_stop_rec(self) -> None:
+        self._rec_on = False
+        self.rec_start_btn.setEnabled(True)
+        self.rec_stop_btn.setEnabled(False)
+        self.rec_folder_btn.setEnabled(True)
+        # Write metadata file summarizing the session
+        try:
+            if self._rec_dir:
+                meta_path = os.path.join(self._rec_dir, "metadata.txt")
+                lines = []
+                started = self._rec_meta.get("started_at", "")
+                samp_hz = float(self._rec_meta.get("sampling_frequency_hz", 0.0))
+                frame_hz = float(self._rec_meta.get("frame_rate_hz", 0.0))
+                lines.append(f"started_at: {started}\n")
+                lines.append(f"sampling_frequency_hz: {samp_hz:.6f}\n")
+                lines.append(f"frame_rate_hz: {frame_hz:.3f}\n")
+                lines.append(f"acquisitions_saved: {self._rec_count}\n")
+                with open(meta_path, "w", encoding="utf-8") as mf:
+                    mf.writelines(lines)
+        except Exception as e:
+            self.status_lbl.setText(f"Status: Metadata write failed — {e}")
+        self.status_lbl.setText("Status: Recording stopped")
 
 
 def picoscope_5000_block() -> int:
